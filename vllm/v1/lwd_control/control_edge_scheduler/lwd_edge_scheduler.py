@@ -375,6 +375,29 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
         return out
 
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        """边侧直通:不排 encoder 输入、不耗预算、不回滚。
+
+        边侧视觉塔执行与编码缓存由 edge worker 自管(惰性编码 +
+        _lwd_mm_hash_embeds,mm 特征登记走 scheduled_new_reqs),调度侧
+        原生 encoder 预算/缓存簿记对边侧纯冗余;而其预算/缓存耗尽时
+        的合法回滚(只排图像占位之前的文本,scheduler.py:1270-1289)
+        会破坏 picker 的 chunk 契约——picker 切块必须被原生调度逐字
+        复现(_lwd_schedule_batch 步后核验),回滚一改窗口即触发
+        fail-fast 炸引擎(真机实录:双缓存全关 + 同图并发时,请求级
+        uuid 使 encoder cache 条目不再共享,在途请求的非 freeable
+        条目占满 8192 容量后,后续图像请求被回滚到图像起点)。
+        直通后 mm 占位 token 与文本同等切块,真实编码压力由 worker
+        侧承担;encode/dec cache 簿记恒空,finish 时 free() 为空操作。"""
+        return [], num_new_tokens, encoder_compute_budget, []
+
     def lwd_edge_max_num_seqs_check(self) -> bool:
         """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否
         还有名额,True=可开新请求。
@@ -503,7 +526,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         token_slices: list[list[int]] = []
         prompt_offsets: list[int] = []
         has_mrope: list[bool] = []
-        mrope_slices: list[list[list[int]]] = []
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
@@ -511,16 +533,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
             # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
-            # 恒携带 mrope 行(key 在即恒真);[3,N] 切本 chunk 列 ->
-            # [n,3] 行序与 token 轴对齐,随批下发 worker 组 aux 帧
+            # 恒携带 mrope(key 在即恒真);[3,N] 切本 chunk 列并序列化
+            # 为原始字节随 item 走控制面(wire_version>=2,数据面 aux
+            # 帧已退役)
             positions = self._lwd_mrope_positions_dict.get(request_id)
             req_has_mrope = positions is not None
+            mrope_bytes = b""
+            if req_has_mrope:
+                assert positions is not None
+                mrope_bytes = (
+                    positions[:, offset : offset + num_tokens]
+                    .contiguous()
+                    .numpy()
+                    .tobytes()
+                )
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
+                    mrope_positions=mrope_bytes,
                 )
             )
             req_ids.append(request_id)
@@ -529,13 +562,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             prompt_offsets.append(offset)
             has_mrope.append(req_has_mrope)
-            if req_has_mrope:
-                assert positions is not None
-                mrope_slices.append(
-                    positions[:, offset : offset + num_tokens].t().tolist()
-                )
-            else:
-                mrope_slices.append([])
         if not items:
             return True
         seqno = self._lwd_seqno
@@ -561,7 +587,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
         # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
         # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化);
-        # mrope 行同序携带(仅 MM 请求非空),worker 据此组 aux 帧
+        # mrope positions 已随 RangeNotify 走控制面,边 worker 不再
+        # 组 aux 帧
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -570,7 +597,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 token_ids=token_slices,
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
-                mrope_positions=mrope_slices,
             ),
         )
         return True
