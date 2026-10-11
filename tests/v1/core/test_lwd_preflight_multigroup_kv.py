@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regressions for issue #1: preflight KV 估算必须是多组真实口径。
 
-复现基线(1010_lwd_repro_clean.log, seqno=446):
+第一类(seqno=446,1010_lwd_repro_clean.log):
   DSV4-Flash 六组异构 KV cache(组 block_size 512/4096/128/128/8/32,
   由日志 blocks_to_alloc 反推:3504 token -> 7+1+28+28+438+110=612 块,
   uncapped need_slot 口径 613)。旧单组公式 cdiv(num_tokens, 128) 只估
   28 块,偏低 21.9 倍:free=1731 时 3 个 prefill + 116 decode 被假放行
   (200<=1731),第 3 个 item 在 full_sequence_must_fit 中途被拒 ->
-  batch admission mismatch 崩溃。真实需求 3*613+116*6=2535>1731,
-  preflight 必须整批推迟。
+  batch admission mismatch 崩溃。真实需求 3*613+116*6=2535>1731。
+
+第二类(seqno=129,1011 真机验证日志):
+  边侧组批预算填尾截断的 chunk(3504 prompt / 1008 notify)——
+  full_sequence_must_fit 的准入计量单位是"全量剩余序列",按 chunk
+  估算只算 178 块,实为 612 块。修复:两道谓词(full-fit 带 cap /
+  chunk 扣减无 cap)取最大。
 """
 
 import ast
@@ -71,7 +76,8 @@ for _name in WANTED_METHODS:
 
 
 class FakeCoordinator:
-    """多组求和假 coordinator:逐组 cdiv(num_tokens, 组 block_size)。"""
+    """多组求和假 coordinator:逐组 cdiv(num_tokens, 组 block_size),
+    按 total_computed 近似扣除已持有块(无 SWA 窗口扣减,精度足够)。"""
 
     def __init__(self, block_sizes):
         self.single_type_managers = [NS(block_size=bs) for bs in block_sizes]
@@ -88,11 +94,15 @@ class FakeCoordinator:
         apply_admission_cap=False,
     ):
         self.calls.append(
-            (request_id, num_tokens, total_computed_tokens,
-             num_tokens_main_model)
+            (num_tokens, total_computed_tokens, num_tokens_main_model,
+             apply_admission_cap)
         )
         return sum(
-            cdiv(num_tokens, m.block_size)
+            max(
+                cdiv(num_tokens, m.block_size)
+                - cdiv(total_computed_tokens, m.block_size),
+                0,
+            )
             for m in self.single_type_managers
         )
 
@@ -163,8 +173,8 @@ class TestPreflightMultiGroupKV(unittest.TestCase):
         self.assertFalse(sched._lwd_preflight_ok(items, 116))
 
     def test_item_cost_uses_need_slot_with_lookahead(self):
-        # 续传 chunk:slot = computed + chunk + spec_factor(>= 实际
-        # lookahead,保守方向),main = computed + chunk,无 admission cap
+        # 续传 chunk:两道谓词——full-fit 按全量剩余序列(9504,带
+        # cap),chunk 扣减按 need_slot(4506,无 cap),取大者
         sched = make_sched(DSV4_GROUP_BLOCK_SIZES, free_blocks=10**6)
         coord = sched.kv_cache_manager.coordinator
         it = item("cont", num_tokens=1000)
@@ -174,11 +184,41 @@ class TestPreflightMultiGroupKV(unittest.TestCase):
             num_tokens=9504,
         )
         cost = sched._lwd_item_block_cost(it)
-        _, num_tokens, total_computed, main = coord.calls[-1]
-        self.assertEqual((num_tokens, total_computed, main),
-                         (4506, 3504, 4504))
-        # Σ cdiv(4506, bs) over (512,4096,128,128,8,32)
-        self.assertEqual(cost, 9 + 2 + 36 + 36 + 564 + 141)
+        full_call, chunk_call = coord.calls[-2], coord.calls[-1]
+        self.assertEqual(full_call, (9504, 3504, 9504, True))
+        self.assertEqual(chunk_call, (4506, 3504, 4504, False))
+        # full-fit: Σ(cdiv(9504,bs)-cdiv(3504,bs)) = 12+2+47+47+750+187
+        # chunk:    Σ(cdiv(4506,bs)-cdiv(3504,bs)) = 2+1+8+8+126+31
+        self.assertEqual(cost, max(1045, 176))
+
+    def test_issue1_truncated_chunk_charged_at_full_prompt(self):
+        # issue #1 第二类:边侧预算填尾截断的 chunk——prompt=3504 而
+        # notify=1008,准入按全量剩余序列计费(612),不是按 chunk(178)
+        sched = make_sched(DSV4_GROUP_BLOCK_SIZES, free_blocks=10**6)
+        it = item("trunc", num_tokens=1008)
+        sched.requests["trunc"] = NS(
+            request_id="trunc",
+            num_computed_tokens=0,
+            num_tokens=3504,
+        )
+        self.assertEqual(sched._lwd_item_block_cost(it), 612)
+
+    def test_issue1_mixed_batch_with_truncated_tail(self):
+        # 崩溃场景缩小版:[全量3504, 全量3504, 截断1008(prompt=3504)]
+        # + 116 decode:need = 613+613+612+116*6 = 2534,边界含等号
+        items = [item("a"), item("b"), item("t", num_tokens=1008)]
+        sched = make_sched(DSV4_GROUP_BLOCK_SIZES, free_blocks=2534)
+        self.add_requests(sched, items[:2])
+        sched.requests["t"] = NS(
+            request_id="t", num_computed_tokens=0, num_tokens=3504
+        )
+        self.assertTrue(sched._lwd_preflight_ok(items, 116))
+        sched = make_sched(DSV4_GROUP_BLOCK_SIZES, free_blocks=2533)
+        self.add_requests(sched, items[:2])
+        sched.requests["t"] = NS(
+            request_id="t", num_computed_tokens=0, num_tokens=3504
+        )
+        self.assertFalse(sched._lwd_preflight_ok(items, 116))
 
     def test_decode_cost_sums_across_groups(self):
         # spec_factor=2:每组 cdiv(2, bs)=1,六组共 6(旧公式只算 1)

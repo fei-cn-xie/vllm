@@ -313,22 +313,46 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 need_blocks, free_blocks, len(items), num_decode,
             )
             return False
+        # 放行也打水位:hold/pass 成对出现,每步都有 free 曲线可查
+        # (issue #1 两轮定位都靠事后拼日志,放行缺水位曾多跑一轮往返)
+        logger.info(
+            "[Lwd][cloud-sched] preflight pass: kv need=%d free=%d "
+            "(items=%d decode=%d)",
+            need_blocks, free_blocks, len(items), num_decode,
+        )
         return True
 
     def _lwd_item_block_cost(self, item: LwdRangeItem) -> int:
-        """该 item 本步的多组真实块需求(与 allocate_slots 同谓词)。
+        """该 item 本步的多组真实块需求(两道检查取大,issue #1 两类根因)。
 
-        口径对齐 kv_cache_manager.allocate_slots 的实际扣减:
-        need_slot = computed + chunk + spec 因数(>= 实际 lookahead,
-        多算的 token 至多使某组 cdiv +1,是安全方向),不带 admission
-        cap(与实际扣减一致,cap 只会更低),total_computed 传入当前
-        水位使谓词扣除已持有块(续传 chunk 不重复计费)。"""
+        allocate_slots 对每 item 有两道独立的块检查,估算必须同时覆盖:
+        ① full_sequence_must_fit 准入闸——按"全量剩余序列"计量
+           (min(request.num_tokens, max_model_len),带 admission cap)。
+           边侧预算填尾截断的 chunk(chunk << 剩余 prompt)按 chunk
+           计量会严重低估(issue #1 第二类:3504 prompt / 1008 chunk
+           实为 612 块,按 chunk 只算 178);
+        ② 实际扣减——按 need_slot = computed + chunk + spec 因数
+           (>= 实际 lookahead,偏保守方向),不带 cap。
+        取两者最大,保证放行后两道检查都必然通过。total_computed 传
+        当前水位使谓词扣除已持有块(续传 chunk 不重复计费);前缀
+        缓存命中被忽略(命中只降占用,高估安全)。"""
         request = self.requests[item.request_id]
         computed = request.num_computed_tokens
+        full = min(request.num_tokens, self.max_model_len)
         main = computed + item.num_tokens
         slot = min(main + self._lwd_spec_factor, self.max_model_len)
-        empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks.blocks
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        kv = self.kv_cache_manager
+        empty_blocks = kv.empty_kv_cache_blocks.blocks
+        full_fit = kv.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full,
+            new_computed_blocks=empty_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=computed,
+            num_tokens_main_model=full,
+            apply_admission_cap=True,
+        )
+        chunk_alloc = kv.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=slot,
             new_computed_blocks=empty_blocks,
@@ -336,6 +360,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             total_computed_tokens=computed,
             num_tokens_main_model=main,
         )
+        return max(full_fit, chunk_alloc)
 
     def _lwd_decode_blocks_per_req(self) -> int:
         """decode 每请求每步 KV 块上界:各组各 cdiv(1+k, 组 block_size)。
@@ -348,21 +373,33 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             for manager in managers
         )
 
-    @staticmethod
     def _lwd_verify_full_admission(
-        out: SchedulerOutput, notify: LwdRangeNotify, items: list[LwdRangeItem]
+        self, out: SchedulerOutput, notify: LwdRangeNotify,
+        items: list[LwdRangeItem],
     ) -> None:
         """步后核验:批内每请求排程量 == 预告量(chunk 精确准入)。
         不等即配置发散/KV 失守(错排会让整批 UP 张量留残余行),
-        fail-fast 不当场炸就会静默错算。"""
+        fail-fast 不当场炸就会静默错算。报错前 dump 逐 item 现场与
+        当前水位,崩溃自带完整遗照(诊断不再依赖日志恰好齐全)。"""
         for item in items:
             scheduled = out.num_scheduled_tokens.get(item.request_id, 0)
             if scheduled != item.num_tokens:
+                detail = ", ".join(
+                    "{}:{}/{}".format(
+                        it.request_id.rsplit("-", 1)[-1],
+                        out.num_scheduled_tokens.get(it.request_id, 0),
+                        it.num_tokens,
+                    )
+                    for it in items
+                )
+                free = self.kv_cache_manager.block_pool.get_num_free_blocks()
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] batch admission mismatch "
                     f"req={item.request_id} seqno={notify.seqno}: "
                     f"scheduled={scheduled} != notify={item.num_tokens} "
-                    f"(mixed mode forbids partial admission)"
+                    f"(mixed mode forbids partial admission); "
+                    f"batch [suffix:scheduled/notify]={detail}; "
+                    f"free_blocks_now={free}"
                 )
 
     # ------------------------------------------------------------------ #
