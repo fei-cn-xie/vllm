@@ -230,11 +230,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
     def _lwd_preflight_ok(
         self, items: list[LwdRangeItem], num_decode: int
     ) -> bool:
-        """放行三检:token 预算 / 并发名额 / KV 保守预估。
+        """放行三检:token 预算 / 并发名额 / KV 多组真实预估。
 
         预算与名额本由边侧 cap 保证(设计 §2),此处是双保险;KV 预估
-        忽略前缀缓存命中(命中只降占用,高估是安全方向)。decode 占用
-        按 1+k 计(MTP 草稿 token 同样吃预算;KV 块预留同系数上取整)。"""
+        走 coordinator 逐组求和(与 allocate_slots 同谓词,忽略前缀
+        缓存命中——命中只降占用,高估是安全方向)。decode 占用按每请求
+        各组 cdiv(1+k) 取上界。单组公式 cdiv(num_tokens, block_size)
+        在混合多组架构(SWA/压缩组各自持 block_size)下严重低估:
+        issue #1 即 DSV4 六组 612 vs 28(偏低 21.9 倍),整批被假放行
+        后第 3 个 item 在 full_sequence_must_fit 中途被拒 -> mismatch。"""
         need_tokens = (
             sum(item.num_tokens for item in items)
             + num_decode * self._lwd_spec_factor
@@ -258,18 +262,51 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
-        need_blocks = (
-            sum(cdiv(item.num_tokens, self.block_size) for item in items)
-            + num_decode * cdiv(self._lwd_spec_factor, self.block_size)
-        )
+        need_blocks = sum(
+            self._lwd_item_block_cost(item) for item in items
+        ) + num_decode * self._lwd_decode_blocks_per_req()
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
             logger.info(
-                "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d",
-                need_blocks, free_blocks,
+                "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d "
+                "(items=%d decode=%d, multi-group cost)",
+                need_blocks, free_blocks, len(items), num_decode,
             )
             return False
         return True
+
+    def _lwd_item_block_cost(self, item: LwdRangeItem) -> int:
+        """该 item 本步的多组真实块需求(与 allocate_slots 同谓词)。
+
+        口径对齐 kv_cache_manager.allocate_slots 的实际扣减:
+        need_slot = computed + chunk + spec 因数(>= 实际 lookahead,
+        多算的 token 至多使某组 cdiv +1,是安全方向),不带 admission
+        cap(与实际扣减一致,cap 只会更低),total_computed 传入当前
+        水位使谓词扣除已持有块(续传 chunk 不重复计费)。"""
+        request = self.requests[item.request_id]
+        computed = request.num_computed_tokens
+        main = computed + item.num_tokens
+        slot = min(main + self._lwd_spec_factor, self.max_model_len)
+        empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks.blocks
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=slot,
+            new_computed_blocks=empty_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=computed,
+            num_tokens_main_model=main,
+        )
+
+    def _lwd_decode_blocks_per_req(self) -> int:
+        """decode 每请求每步 KV 块上界:各组各 cdiv(1+k, 组 block_size)。
+
+        实际 decode 常复用尾块、SWA 还会释放,占用低于此上界——偏高
+        只会把混排推迟一步(decode 泄压后重试),方向安全。"""
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        return sum(
+            cdiv(self._lwd_spec_factor, manager.block_size)
+            for manager in managers
+        )
 
     @staticmethod
     def _lwd_verify_full_admission(
