@@ -54,6 +54,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._lwd_log_build_pair()
         # prefill 通知队列:边侧批量范围预告(RangeNotify)逐条入队,每步
         # 至多消费队首一条;预告自带 seqno 即本批 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
@@ -83,6 +84,45 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_spec_draft_tokens = 0
         self._lwd_spec_accepted = 0
         self._lwd_spec_last_log = time.monotonic()
+
+    @staticmethod
+    def _lwd_log_build_pair() -> None:
+        """启动横幅:双仓 git 指纹(vllm / vllm-ascend)。
+
+        LWD 协议跨两仓共同演化,边云代码必须配对部署;日志首行即可
+        定位代码组合,免去从上下文反推 commit。git 不可用(如非
+        editable 安装)时打印 ?,不影响启动。"""
+        import subprocess
+        from pathlib import Path
+
+        def fingerprint(repo_root: Path) -> str:
+            try:
+                sha = subprocess.run(
+                    ["git", "-C", str(repo_root), "rev-parse", "--short",
+                     "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                branch = subprocess.run(
+                    ["git", "-C", str(repo_root), "branch",
+                     "--show-current"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+            except Exception:
+                return "?"
+            return f"{sha or '?'}({branch or 'detached'})"
+
+        vllm_root = Path(__file__).resolve().parents[4]
+        try:
+            import vllm_ascend
+            ascend = fingerprint(
+                Path(vllm_ascend.__file__).resolve().parents[1]
+            )
+        except Exception:
+            ascend = "(vllm_ascend not importable)"
+        logger.info(
+            "[Lwd] build pair: vllm=%s vllm-ascend=%s",
+            fingerprint(vllm_root), ascend,
+        )
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
