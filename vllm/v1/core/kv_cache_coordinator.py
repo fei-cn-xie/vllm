@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -25,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -116,6 +119,18 @@ class KVCacheCoordinator(ABC):
                 scheduler_block_size=self.scheduler_block_size,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+        )
+
+        # [Diag] one-time KV group layout: per-group manager type and
+        # tokens-per-block density. Any admission cost (e.g. 612 blocks for
+        # 3504 tokens on DSV4) decomposes as sum of cdiv(tokens, block_size)
+        # over these groups.
+        logger.info(
+            "[Diag][layout] kv groups: %s",
+            ", ".join(
+                f"g{i}={type(m).__name__}:block_size={m.block_size}"
+                for i, m in enumerate(self.single_type_managers)
+            ),
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
