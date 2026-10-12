@@ -364,7 +364,16 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            free_blocks = self.block_pool.get_num_free_blocks()
+            gate_hold = num_blocks_to_allocate > free_blocks
+            # [Diag] admission gate reading: multi-group block need vs free,
+            # visible on both centralized and LWD-cloud runs (shared path).
+            logger.info(
+                "[Diag][gate] req=%s full_tokens=%d need=%d free=%d -> %s",
+                request.request_id, full_num_tokens, num_blocks_to_allocate,
+                free_blocks, "hold" if gate_hold else "pass",
+            )
+            if gate_hold:
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens

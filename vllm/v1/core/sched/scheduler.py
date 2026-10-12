@@ -354,6 +354,9 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        # [Diag] per-step block accounting for centralized-vs-LWD comparison
+        diag_free_pre = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        self._diag_step = getattr(self, "_diag_step", 0) + 1
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -499,6 +502,14 @@ class Scheduler(SchedulerInterface):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
+                    # [Diag] preemption = recompute: blocks freed and
+                    # num_computed_tokens reset to 0, request re-queued.
+                    logger.warning(
+                        "[Diag][preempt] req=%s num_tokens=%d -> recompute "
+                        "(num_computed reset), running_left=%d",
+                        preempted_req.request_id, preempted_req.num_tokens,
+                        len(self.running),
+                    )
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
@@ -763,6 +774,9 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                diag_admit_free = (
+                    self.kv_cache_manager.block_pool.get_num_free_blocks()
+                )
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -784,6 +798,16 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+                # [Diag] fresh admission: chunk vs prompt size, blocks taken
+                logger.info(
+                    "[Diag][admit] req=%s chunk=%d prompt=%d alloc_blocks=%d "
+                    "free=%d",
+                    request.request_id, num_new_tokens,
+                    request.num_prompt_tokens,
+                    diag_admit_free
+                    - self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                    self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -969,6 +993,28 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # [Diag] per-step summary mirroring the LWD cloud-side sched line:
+        # batch composition, block delta, queue depths, preemptions.
+        diag_free_now = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        diag_prefill_n = sum(
+            1
+            for t in scheduler_output.num_scheduled_tokens.values()
+            if t > 8
+        )
+        logger.info(
+            "[Diag][step] step=%d reqs=%d prefill_n=%d tokens=%d "
+            "free=%d->%d(%+d) waiting=%d running=%d preempted=%d",
+            self._diag_step,
+            len(scheduler_output.num_scheduled_tokens),
+            diag_prefill_n,
+            scheduler_output.total_num_scheduled_tokens,
+            diag_free_pre,
+            diag_free_now,
+            diag_free_now - diag_free_pre,
+            len(self.waiting),
+            len(self.running),
+            len(preempted_reqs),
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(
