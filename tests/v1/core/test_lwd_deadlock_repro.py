@@ -234,6 +234,29 @@ class TestDeadlockRepro(unittest.TestCase):
             148,
         )
 
+    def test_deadlock_must_be_resolved(self):
+        """REGRESSION — expected to FAIL until the deadlock fix lands.
+
+        Desired behavior: with the field state, the system must make
+        progress within a bounded number of steps (head notify
+        dispatches, or the queue otherwise drains). Today the loop
+        deadlocks (issue #1): this assertion fails on purpose and stays
+        red until edge block-budget backpressure, a watchdog, or
+        partial admission resolves it. Flip to green = fix accepted.
+        """
+        sched = make_deadlock_sched()
+        for _ in range(100):
+            if sched.mixed_calls:
+                break
+            sched._schedule_impl()
+        self.assertTrue(
+            sched.mixed_calls,
+            "tail-of-load deadlock (issue #1): head notify seqno=127 "
+            "held forever with decode_ready=0 and R mid-prompt holding "
+            "blocks; resolve via edge block-budget backpressure, "
+            "watchdog, or partial admission",
+        )
+
     def test_counterfactual_one_fewer_full_item_unlocks(self):
         """Dropping one fresh 3504 item (-613 blocks) admits the batch:
         the deadlock margin was exactly one full first-chunk request."""
