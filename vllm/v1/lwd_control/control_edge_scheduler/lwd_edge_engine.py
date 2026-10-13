@@ -427,13 +427,19 @@ class LwdEdgeEngineCore(EngineCoreProc):
         if not self.scheduler.lwd_edge_notify(scheduler_output):
             return None
         batch = scheduler_output.lwd_batch
+        meta = batch.batch_meta
         n_emb, n_unemb = self._lwd_queue_mix()
+        # 逐项 chunk 尺寸与云侧 hold 逐项成本对称:截断/续传零头直接可读
+        chunks = ",".join(
+            f"{rid.rsplit('-', 1)[-1]}:{len(tids)}"
+            for rid, tids in zip(meta.req_ids, meta.token_ids)
+        )
         logger.info(
             "[Lwd][sched] edge dispatch-embed seqno=%d reqs=%s tokens=%d "
-            "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
-            batch.seqno, batch.batch_meta.req_ids,
+            "chunks=[%s] ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
+            batch.seqno, meta.req_ids,
             scheduler_output.total_num_scheduled_tokens,
-            n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
+            chunks, n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
         )
         return self.model_executor.execute_model(
             scheduler_output, non_block=True

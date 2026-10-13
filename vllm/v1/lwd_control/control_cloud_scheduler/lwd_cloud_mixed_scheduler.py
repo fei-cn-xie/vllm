@@ -302,15 +302,25 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
-        need_blocks = sum(
-            self._lwd_item_block_cost(item) for item in items
-        ) + num_decode * self._lwd_decode_blocks_per_req()
+        item_costs = [
+            (item.request_id.rsplit("-", 1)[-1],
+             self._lwd_item_block_cost(item))
+            for item in items
+        ]
+        need_blocks = (
+            sum(cost for _, cost in item_costs)
+            + num_decode * self._lwd_decode_blocks_per_req()
+        )
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
+            # hold 与 pass 同粒度:被拒的批打逐项块成本,排障不再依赖
+            # 二次往返(issue #1 死锁批的逐项构成曾因缺此行无法实证)
+            detail = ",".join(f"{rid}:{cost}" for rid, cost in item_costs)
             logger.info(
                 "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d "
-                "(items=%d decode=%d, multi-group cost)",
-                need_blocks, free_blocks, len(items), num_decode,
+                "(items=%d decode=%d, multi-group cost; "
+                "per_item[suffix:blocks]=[%s])",
+                need_blocks, free_blocks, len(items), num_decode, detail,
             )
             return False
         # 放行也打水位:hold/pass 成对出现,每步都有 free 曲线可查
