@@ -121,6 +121,18 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
+        # [lwd][diag] grep anchor for the pool sizing and cap-knee inputs:
+        # a recycling-aware group's admission cap is
+        # cdiv(min(win - 1 + max_batched_tokens, max_model_len), bs) + 1,
+        # binding once cdiv(tokens, bs) exceeds it.
+        logger.info(
+            "[lwd][diag] kv pool: gpu_blocks=%d max_model_len=%d "
+            "max_batched_tokens=%d",
+            self.kv_cache_config.num_blocks,
+            max_model_len,
+            max_num_batched_tokens,
+        )
+
         # [Diag] one-time KV group layout: per-group manager type,
         # tokens-per-block density, and recycling bounds. Admission cost
         # decomposes as sum of cdiv(tokens, block_size) per group, where

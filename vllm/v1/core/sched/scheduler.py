@@ -522,10 +522,13 @@ class Scheduler(SchedulerInterface):
             # [Diag] running prefill chunk: per-group new/held blocks. Held
             # plateaus at the admission cap for recycling-aware groups (SWA /
             # chunked-local) once the sequence grows past their window.
+            # Shares the [lwd][diag] first-10 counter with [Diag][admit].
             if request.is_prefill_chunk:
+                self._lwd_diag_occ_n = getattr(self, "_lwd_diag_occ_n", 0) + 1
                 logger.info(
-                    "[Diag][chunk] req=%s span=[%d..%d) alloc_g=[%s] held_g=[%s] "
-                    "free=%d",
+                    "%s[Diag][chunk] req=%s span=[%d..%d) alloc_g=[%s] "
+                    "held_g=[%s] free=%d",
+                    "[lwd][diag] " if self._lwd_diag_occ_n <= 10 else "",
                     request.request_id,
                     request.num_computed_tokens,
                     request.num_computed_tokens + num_new_tokens,
@@ -819,13 +822,26 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.free(request)
                     break
                 # [Diag] fresh admission: chunk vs prompt size, blocks taken
+                # (net free delta), per-group new/held blocks. The first 10
+                # occupancy prints (admit + chunk share one counter) carry
+                # the [lwd][diag] grep anchor, covering the first request's
+                # full admission trajectory in one grep.
+                self._lwd_diag_occ_n = getattr(self, "_lwd_diag_occ_n", 0) + 1
                 logger.info(
-                    "[Diag][admit] req=%s chunk=%d prompt=%d alloc_blocks=%d "
-                    "free=%d",
+                    "%s[Diag][admit] req=%s chunk=%d prompt=%d alloc_blocks=%d "
+                    "alloc_g=[%s] held_g=[%s] free=%d",
+                    "[lwd][diag] " if self._lwd_diag_occ_n <= 10 else "",
                     request.request_id, num_new_tokens,
                     request.num_prompt_tokens,
                     diag_admit_free
                     - self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                    ",".join(str(len(b)) for b in new_blocks.blocks),
+                    ",".join(
+                        str(len(ids))
+                        for ids in self.kv_cache_manager.get_block_ids(
+                            request_id
+                        )
+                    ),
                     self.kv_cache_manager.block_pool.get_num_free_blocks(),
                 )
 

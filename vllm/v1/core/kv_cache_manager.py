@@ -372,10 +372,13 @@ class KVCacheManager:
             # [Diag] admission gate reading: multi-group block need vs free,
             # visible on both centralized and LWD-cloud runs (shared path).
             # groups= decomposes the need, making cap plateaus (long prompts)
-            # attributable to specific groups.
+            # attributable to specific groups. The first 10 prints carry the
+            # [lwd][diag] grep anchor (first request's admission story).
+            self._lwd_diag_gate_n = getattr(self, "_lwd_diag_gate_n", 0) + 1
             logger.info(
-                "[Diag][gate] req=%s full_tokens=%d need=%d free=%d -> %s "
+                "%s[Diag][gate] req=%s full_tokens=%d need=%d free=%d -> %s "
                 "groups=[%s]",
+                "[lwd][diag] " if self._lwd_diag_gate_n <= 10 else "",
                 request.request_id, full_num_tokens, num_blocks_to_allocate,
                 free_blocks, "hold" if gate_hold else "pass",
                 ",".join(str(n) for n in need_by_group),
