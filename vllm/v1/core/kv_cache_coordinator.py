@@ -121,14 +121,26 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
-        # [Diag] one-time KV group layout: per-group manager type and
-        # tokens-per-block density. Any admission cost (e.g. 612 blocks for
-        # 3504 tokens on DSV4) decomposes as sum of cdiv(tokens, block_size)
-        # over these groups.
+        # [Diag] one-time KV group layout: per-group manager type,
+        # tokens-per-block density, and recycling bounds. Admission cost
+        # decomposes as sum of cdiv(tokens, block_size) per group, where
+        # recycling-aware groups (SWA / chunked-local) clamp their share at
+        # admission_cap blocks -- so long-sequence cost plateaus there while
+        # uncapped groups stay linear.
         logger.info(
             "[Diag][layout] kv groups: %s",
             ", ".join(
                 f"g{i}={type(m).__name__}:block_size={m.block_size}"
+                + (
+                    f":win={m.sliding_window}"
+                    if getattr(m, "sliding_window", None)
+                    else ""
+                )
+                + (
+                    f":admission_cap={m._max_admission_blocks_per_request}"
+                    if getattr(m, "_max_admission_blocks_per_request", None)
+                    else ""
+                )
                 for i, m in enumerate(self.single_type_managers)
             ),
         )
@@ -197,6 +209,47 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def get_num_blocks_to_allocate_by_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """[Diag] Per-group breakdown of get_num_blocks_to_allocate.
+
+        Mirrors the aggregation loop exactly, so sum(returned) equals
+        get_num_blocks_to_allocate for the same arguments.
+        """
+        per_group: list[int] = []
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+            else:
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+        return per_group
 
     def allocate_new_computed_blocks(
         self,

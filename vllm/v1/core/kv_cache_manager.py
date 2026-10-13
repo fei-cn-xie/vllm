@@ -355,7 +355,9 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            # Per-group need (cap-clamped for recycling-aware groups), summed
+            # for the decision so the logged breakdown cannot drift from it.
+            need_by_group = self.coordinator.get_num_blocks_to_allocate_by_group(
                 request_id=request.request_id,
                 num_tokens=full_num_tokens,
                 new_computed_blocks=new_computed_block_list,
@@ -364,14 +366,19 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
+            num_blocks_to_allocate = sum(need_by_group)
             free_blocks = self.block_pool.get_num_free_blocks()
             gate_hold = num_blocks_to_allocate > free_blocks
             # [Diag] admission gate reading: multi-group block need vs free,
             # visible on both centralized and LWD-cloud runs (shared path).
+            # groups= decomposes the need, making cap plateaus (long prompts)
+            # attributable to specific groups.
             logger.info(
-                "[Diag][gate] req=%s full_tokens=%d need=%d free=%d -> %s",
+                "[Diag][gate] req=%s full_tokens=%d need=%d free=%d -> %s "
+                "groups=[%s]",
                 request.request_id, full_num_tokens, num_blocks_to_allocate,
                 free_blocks, "hold" if gate_hold else "pass",
+                ",".join(str(n) for n in need_by_group),
             )
             if gate_hold:
                 return None

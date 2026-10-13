@@ -519,6 +519,26 @@ class Scheduler(SchedulerInterface):
                 # Cannot schedule this request.
                 break
 
+            # [Diag] running prefill chunk: per-group new/held blocks. Held
+            # plateaus at the admission cap for recycling-aware groups (SWA /
+            # chunked-local) once the sequence grows past their window.
+            if request.is_prefill_chunk:
+                logger.info(
+                    "[Diag][chunk] req=%s span=[%d..%d) alloc_g=[%s] held_g=[%s] "
+                    "free=%d",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    request.num_computed_tokens + num_new_tokens,
+                    ",".join(str(len(b)) for b in new_blocks.blocks),
+                    ",".join(
+                        str(len(ids))
+                        for ids in self.kv_cache_manager.get_block_ids(
+                            request.request_id
+                        )
+                    ),
+                    self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                )
+
             # Schedule the request.
             scheduled_running_reqs.append(request)
             request_id = request.request_id
