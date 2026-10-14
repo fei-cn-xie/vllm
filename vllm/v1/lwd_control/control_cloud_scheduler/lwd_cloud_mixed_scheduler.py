@@ -269,6 +269,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 need_blocks, free_blocks,
             )
             return False
+        # [lwd][diag] pass reading of the legacy single-group estimate
+        # (cdiv(tokens, block_size)); issue #1 root cause 1/2 formula.
+        # Expected to grossly undercount multi-group reality -- that is
+        # the point of this branch's comparison run.
+        logger.info(
+            "[lwd][diag] mm-preflight pass: single-group need=%d free=%d "
+            "(items=%d decode=%d)",
+            need_blocks, free_blocks, len(items), num_decode,
+        )
         return True
 
     @staticmethod

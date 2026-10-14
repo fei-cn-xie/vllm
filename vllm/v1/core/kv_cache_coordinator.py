@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -25,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -118,6 +121,39 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
+        # [lwd][diag] grep anchor for the pool sizing and cap-knee inputs:
+        # a recycling-aware group's admission cap is
+        # cdiv(min(win - 1 + max_batched_tokens, max_model_len), bs) + 1,
+        # binding once cdiv(tokens, bs) exceeds it.
+        logger.info(
+            "[lwd][diag] kv pool: gpu_blocks=%d max_model_len=%d "
+            "max_batched_tokens=%d",
+            self.kv_cache_config.num_blocks,
+            max_model_len,
+            max_num_batched_tokens,
+        )
+        # [lwd][diag] one-time KV group layout: manager type, tokens-per-block
+        # density, and recycling bounds per group. Admission cost decomposes
+        # as sum of cdiv(tokens, block_size) per group, where recycling-aware
+        # groups (SWA / chunked-local) clamp their share at admission_cap.
+        logger.info(
+            "[lwd][diag] kv groups: %s",
+            ", ".join(
+                f"g{i}={type(m).__name__}:block_size={m.block_size}"
+                + (
+                    f":win={m.sliding_window}"
+                    if getattr(m, "sliding_window", None)
+                    else ""
+                )
+                + (
+                    f":admission_cap={m._max_admission_blocks_per_request}"
+                    if getattr(m, "_max_admission_blocks_per_request", None)
+                    else ""
+                )
+                for i, m in enumerate(self.single_type_managers)
+            ),
+        )
+
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;
@@ -182,6 +218,47 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
         return num_blocks_to_allocate
+
+    def get_num_blocks_to_allocate_by_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """[lwd][diag] Per-group breakdown of get_num_blocks_to_allocate.
+
+        Mirrors the aggregation loop exactly, so sum(returned) equals
+        get_num_blocks_to_allocate for the same arguments.
+        """
+        per_group: list[int] = []
+        for i, manager in enumerate(self.single_type_managers):
+            if isinstance(manager, CrossAttentionManager):
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+            else:
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
+                )
+        return per_group
 
     def allocate_new_computed_blocks(
         self,

@@ -355,16 +355,30 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
+            # [lwd][diag] admission gate reading: capped per-group need vs
+            # free, both outcomes logged. groups= shows which groups are
+            # clamped at their admission cap (long-prompt cost plateau).
+            gate_need_by_group = (
+                self.coordinator.get_num_blocks_to_allocate_by_group(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            gate_need = sum(gate_need_by_group)
+            gate_free = self.block_pool.get_num_free_blocks()
+            logger.info(
+                "[lwd][diag] gate req=%s full_tokens=%d need=%d free=%d -> %s "
+                "groups=[%s]",
+                request.request_id, full_num_tokens, gate_need, gate_free,
+                "pass" if gate_need <= gate_free else "hold",
+                ",".join(str(n) for n in gate_need_by_group),
+            )
+            if gate_need > gate_free:
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -378,11 +392,31 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        # [lwd][diag] reclaim reading: how many blocks the sliding-window
+        # recycle returns to the pool inside this very allocation (the
+        # quantity the LWD preflight on the fixed branch misses). Silent
+        # when nothing is reclaimable.
+        diag_free_pre_reclaim = self.block_pool.get_num_free_blocks()
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
+        diag_reclaimed = (
+            diag_free_pre_reclaim - self.block_pool.get_num_free_blocks()
+        )
+        if diag_reclaimed > 0:
+            logger.info(
+                "[lwd][diag] reclaim req=%s computed=%d reclaimed=%d "
+                "free=%d->%d",
+                request.request_id, total_computed_tokens, diag_reclaimed,
+                diag_free_pre_reclaim,
+                self.block_pool.get_num_free_blocks(),
+            )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        # [lwd][diag] per-step charge reading (post-reclaim, uncapped):
+        # what the allocator actually asks for after the window recycle,
+        # against post-reclaim availability. Prefill chunks only (decode
+        # would flood); both outcomes logged.
+        diag_charge_by_group = self.coordinator.get_num_blocks_to_allocate_by_group(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -391,8 +425,19 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
+        num_blocks_to_allocate = sum(diag_charge_by_group)
 
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        if num_new_tokens > 1 or full_sequence_must_fit:
+            logger.info(
+                "[lwd][diag] chunk-alloc req=%s new_tokens=%d slot_tokens=%d "
+                "need=%d avail=%d -> %s groups=[%s]",
+                request.request_id, num_new_tokens, num_tokens_need_slot,
+                num_blocks_to_allocate, available_blocks,
+                "pass" if num_blocks_to_allocate <= available_blocks
+                else "return-None",
+                ",".join(str(n) for n in diag_charge_by_group),
+            )
         if num_blocks_to_allocate > available_blocks:
             # Cannot allocate new blocks
             return None
