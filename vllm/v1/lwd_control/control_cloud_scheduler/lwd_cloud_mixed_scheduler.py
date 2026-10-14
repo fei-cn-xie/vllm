@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """云侧混合调度器:prefill/decode 同批下发(设计:lwd_mixed_batch_design.md
 + lwd_chunked_prefill_design.md)。
 
@@ -65,9 +67,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
         # 缺省 None 按 0),无 spec 配置即 1
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        num_spec = (
-            getattr(spec_config, "num_speculative_tokens", None) or 0
-        )
+        num_spec = getattr(spec_config, "num_speculative_tokens", None) or 0
         self._lwd_spec_factor: int = 1 + num_spec
         logger.info(
             "[Lwd] cloud mixed scheduler: chunked-prefill batches mixed "
@@ -98,14 +98,16 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         def fingerprint(repo_root: Path) -> str:
             try:
                 sha = subprocess.run(
-                    ["git", "-C", str(repo_root), "rev-parse", "--short",
-                     "HEAD"],
-                    capture_output=True, text=True, timeout=5,
+                    ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 ).stdout.strip()
                 branch = subprocess.run(
-                    ["git", "-C", str(repo_root), "branch",
-                     "--show-current"],
-                    capture_output=True, text=True, timeout=5,
+                    ["git", "-C", str(repo_root), "branch", "--show-current"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 ).stdout.strip()
             except Exception:
                 return "?"
@@ -114,14 +116,14 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         vllm_root = Path(__file__).resolve().parents[4]
         try:
             import vllm_ascend
-            ascend = fingerprint(
-                Path(vllm_ascend.__file__).resolve().parents[1]
-            )
+
+            ascend = fingerprint(Path(vllm_ascend.__file__).resolve().parents[1])
         except Exception:
             ascend = "(vllm_ascend not importable)"
         logger.info(
             "[Lwd] build pair: vllm=%s vllm-ascend=%s",
-            fingerprint(vllm_root), ascend,
+            fingerprint(vllm_root),
+            ascend,
         )
 
     def update_from_output(self, scheduler_output, model_runner_output):
@@ -167,14 +169,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         if not self._lwd_spec_draft_tokens:
             return
         rate = self._lwd_spec_accepted / self._lwd_spec_draft_tokens * 100
-        mean_accept_len = 1 + self._lwd_spec_accepted / max(
-            self._lwd_spec_drafts, 1
-        )
+        mean_accept_len = 1 + self._lwd_spec_accepted / max(self._lwd_spec_drafts, 1)
         logger.info(
             "[Lwd][spec] cumulative: rate=%.1f%% mean_accept_len=%.2f "
             "accepted=%d draft_tokens=%d drafts=%d",
-            rate, mean_accept_len, self._lwd_spec_accepted,
-            self._lwd_spec_draft_tokens, self._lwd_spec_drafts,
+            rate,
+            mean_accept_len,
+            self._lwd_spec_accepted,
+            self._lwd_spec_draft_tokens,
+            self._lwd_spec_drafts,
         )
 
     @staticmethod
@@ -232,7 +235,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 logger.warning(
                     "[Lwd][cloud-sched] drop stale notify item req=%s "
                     "num=%d (already prefilled; duplicate notify?)",
-                    item.request_id, item.num_tokens,
+                    item.request_id,
+                    item.num_tokens,
                 )
                 continue
             ready.append(item)
@@ -267,9 +271,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         )
         return ready
 
-    def _lwd_preflight_ok(
-        self, items: list[LwdRangeItem], num_decode: int
-    ) -> bool:
+    def _lwd_preflight_ok(self, items: list[LwdRangeItem], num_decode: int) -> bool:
         """放行三检:token 预算 / 并发名额 / KV 多组真实预估。
 
         预算与名额本由边侧 cap 保证(设计 §2),此处是双保险;KV 预估
@@ -280,31 +282,30 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         issue #1 即 DSV4 六组 612 vs 28(偏低 21.9 倍),整批被假放行
         后第 3 个 item 在 full_sequence_must_fit 中途被拒 -> mismatch。"""
         need_tokens = (
-            sum(item.num_tokens for item in items)
-            + num_decode * self._lwd_spec_factor
+            sum(item.num_tokens for item in items) + num_decode * self._lwd_spec_factor
         )
         if need_tokens > self.max_num_scheduled_tokens:
             logger.info(
                 "[Lwd][cloud-sched] preflight hold: tokens %d > budget %d",
-                need_tokens, self.max_num_scheduled_tokens,
+                need_tokens,
+                self.max_num_scheduled_tokens,
             )
             return False
         # 名额只数新增准入:续传 chunk 的请求已在 running,再按条目数
         # 计会双重占用名额造成假性 hold(chunk 化前批内恒为新增,
         # len(items) 与新增数相等)
         running_ids = {req.request_id for req in self.running}
-        new_items = sum(
-            1 for item in items if item.request_id not in running_ids
-        )
+        new_items = sum(1 for item in items if item.request_id not in running_ids)
         if len(self.running) + new_items > self.max_num_running_reqs:
             logger.info(
                 "[Lwd][cloud-sched] preflight hold: seqs %d+%d > max %d",
-                len(self.running), new_items, self.max_num_running_reqs,
+                len(self.running),
+                new_items,
+                self.max_num_running_reqs,
             )
             return False
         item_costs = [
-            (item.request_id.rsplit("-", 1)[-1],
-             self._lwd_item_block_cost(item))
+            (item.request_id.rsplit("-", 1)[-1], self._lwd_item_block_cost(item))
             for item in items
         ]
         need_blocks = (
@@ -320,7 +321,11 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d "
                 "(items=%d decode=%d, multi-group cost; "
                 "per_item[suffix:blocks]=[%s])",
-                need_blocks, free_blocks, len(items), num_decode, detail,
+                need_blocks,
+                free_blocks,
+                len(items),
+                num_decode,
+                detail,
             )
             return False
         # 放行也打水位:hold/pass 成对出现,每步都有 free 曲线可查
@@ -328,7 +333,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         logger.info(
             "[Lwd][cloud-sched] preflight pass: kv need=%d free=%d "
             "(items=%d decode=%d)",
-            need_blocks, free_blocks, len(items), num_decode,
+            need_blocks,
+            free_blocks,
+            len(items),
+            num_decode,
         )
         return True
 
@@ -379,12 +387,13 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         只会把混排推迟一步(decode 泄压后重试),方向安全。"""
         managers = self.kv_cache_manager.coordinator.single_type_managers
         return sum(
-            cdiv(self._lwd_spec_factor, manager.block_size)
-            for manager in managers
+            cdiv(self._lwd_spec_factor, manager.block_size) for manager in managers
         )
 
     def _lwd_verify_full_admission(
-        self, out: SchedulerOutput, notify: LwdRangeNotify,
+        self,
+        out: SchedulerOutput,
+        notify: LwdRangeNotify,
         items: list[LwdRangeItem],
     ) -> None:
         """步后核验:批内每请求排程量 == 预告量(chunk 精确准入)。
@@ -412,18 +421,60 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"free_blocks_now={free}"
                 )
 
+    def _lwd_reclaim_hidden_prefill_blocks(self) -> None:
+        """隐藏集半途 prefill 请求:滑窗外死块提前还池(issue #1 假 hold)。
+
+        原生只在 allocate_slots 开头回收窗口外块(源码注明请求排不上也
+        可调);LWD 在两条预告之间不调度半途请求,这些块一直挂在请求名
+        下,preflight 读到的 free 偏低 —— 真实分配器放得下的批被假
+        hold,decode 排干后成死锁环(实测:32k 单请求 need=2137 对
+        回收前 free=1198 假 hold,分配器先回收 3513 再实扣 2137 通过)。
+        把 allocate_slots 对 running 续传请求的那次回收提前到每步调度
+        开头,preflight 的 free 即与放行后的真实水位一致。
+
+        参数逐字对齐 allocate_slots 的回收参数(total_computed_tokens
+        = min(num_computed + 0 + 0, max_model_len)):running 续传无
+        前缀命中/外部 token,只能是当前 num_computed_tokens —— 传大了
+        会把下一个 chunk 仍要读的窗口内块提前还掉,被它请求拿走后静默
+        错算(test_lwd_reclaim_equivalence 锁此参数)。幂等:块表遇
+        null 即停,每 chunk 至多实际回收一次。need 侧不受影响:回收
+        只把块替换为 null,块表长度不变,成本谓词按表长扣减已持块
+        (实测回收前后 need 同为 2137)。"""
+        pool = self.kv_cache_manager.block_pool
+        for req in self.running:
+            if self._lwd_is_decode(req):
+                continue  # decode 每步被调度,allocate_slots 自会回收
+            before = pool.get_num_free_blocks()
+            self.kv_cache_manager.remove_skipped_blocks(
+                req.request_id,
+                min(req.num_computed_tokens, self.max_model_len),
+            )
+            freed = pool.get_num_free_blocks() - before
+            if freed > 0:
+                # hold/pass 行里的 free 是回收后水位,与 reclaim 行相减
+                # 即可复原完整曲线(issue #1 两轮定位都靠事后拼 free)
+                logger.info(
+                    "[Lwd][cloud-sched] reclaim req=%s computed=%d "
+                    "freed=%d free=%d->%d",
+                    req.request_id,
+                    req.num_computed_tokens,
+                    freed,
+                    before,
+                    before + freed,
+                )
+
     # ------------------------------------------------------------------ #
     # 调度主体                                                            #
     # ------------------------------------------------------------------ #
     def _schedule_impl(self) -> SchedulerOutput:
+        # 先回收半途请求的滑窗外死块:preflight 的 free 必须与放行后
+        # allocate_slots 开头那次回收的水位一致,否则真实放得下的批
+        # 被假 hold(issue #1 死锁环的第三类根因)
+        self._lwd_reclaim_hidden_prefill_blocks()
         decode_ids = self._lwd_collect_decode_requests()
-        notify = (
-            self.prefill_notify_queue[0] if self.prefill_notify_queue else None
-        )
+        notify = self.prefill_notify_queue[0] if self.prefill_notify_queue else None
         if notify is not None:
-            items, unknown = self._lwd_classify_items(
-                self._lwd_notify_items(notify)
-            )
+            items, unknown = self._lwd_classify_items(self._lwd_notify_items(notify))
             if not items and not unknown:
                 # 全部条目失效(完结/重复):弹队,本步纯 decode。
                 # 按对象身份弹(abort 清扫可能整体替换过 deque,见
@@ -453,8 +504,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 logger.info(
                     "[Lwd][cloud-sched] notify seqno=%d deferred: preflight "
                     "rejected (reqs=%d tokens=%d decode=%d pending_notify=%d)",
-                    notify.seqno, len(items),
-                    sum(item.num_tokens for item in items), len(decode_ids),
+                    notify.seqno,
+                    len(items),
+                    sum(item.num_tokens for item in items),
+                    len(decode_ids),
                     len(self.prefill_notify_queue),
                 )
                 notify = None
@@ -484,7 +537,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         影响(病态小 chunk 配置见设计 §8-C9)。"""
         logger.info(
             "[Lwd][cloud-sched] mixed notify seqno=%d reqs=%s tokens=%d",
-            notify.seqno, [item.request_id for item in items],
+            notify.seqno,
+            [item.request_id for item in items],
             sum(item.num_tokens for item in items),
         )
         for item in items:
@@ -530,9 +584,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             decode_exact += max(
                 0,
                 min(
-                    req.num_tokens_with_spec
-                    + placeholders
-                    - req.num_computed_tokens,
+                    req.num_tokens_with_spec + placeholders - req.num_computed_tokens,
                     self.max_model_len - 1 - req.num_computed_tokens,
                 ),
             )
@@ -547,9 +599,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         try:
             out = self._lwd_schedule_for_visible_reqs(req_ids)
         finally:
-            self.scheduler_config.long_prefill_token_threshold = (
-                saved_threshold
-            )
+            self.scheduler_config.long_prefill_token_threshold = saved_threshold
             self.max_num_scheduled_tokens = saved_budget
         self._lwd_verify_full_admission(out, notify, items)
         # 消费队首:abort 清扫(IO 线程)可能整体替换过 deque,按对象
@@ -614,7 +664,11 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         logger.info(
             "[Lwd][sched] cloud step=%d phase=%s seqno=%s reqs=[%s] tokens=%d "
             "pending_notify=%d decode_ready=%d",
-            self._lwd_sched_step, phase, seqno, reqs_str,
-            out.total_num_scheduled_tokens, len(self.prefill_notify_queue),
+            self._lwd_sched_step,
+            phase,
+            seqno,
+            reqs_str,
+            out.total_num_scheduled_tokens,
+            len(self.prefill_notify_queue),
             len(self._lwd_collect_decode_requests()),
         )
