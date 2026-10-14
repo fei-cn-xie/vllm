@@ -81,6 +81,8 @@ class KVCacheCoordinator(ABC):
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
+        # [lwd][diag] kept for the lazy layout fallback below.
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_caching = enable_caching
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
         # of the hash_block_size and the block size of each group.
@@ -153,6 +155,7 @@ class KVCacheCoordinator(ABC):
                 for i, m in enumerate(self.single_type_managers)
             ),
         )
+        self._lwd_diag_layout_done = True
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -234,6 +237,35 @@ class KVCacheCoordinator(ABC):
         Mirrors the aggregation loop exactly, so sum(returned) equals
         get_num_blocks_to_allocate for the same arguments.
         """
+        # Fallback emission: the __init__ lines print once at engine start,
+        # which predates a warm-started log window; re-emit on first use so
+        # any single-run capture still contains pool + layout.
+        if not getattr(self, "_lwd_diag_layout_done", False):
+            self._lwd_diag_layout_done = True
+            logger.info(
+                "[lwd][diag] kv pool: gpu_blocks=%d max_model_len=%d "
+                "max_batched_tokens=%d (lazy)",
+                self.kv_cache_config.num_blocks,
+                self.max_model_len,
+                self.max_num_batched_tokens,
+            )
+            logger.info(
+                "[lwd][diag] kv groups: %s (lazy)",
+                ", ".join(
+                    f"g{i}={type(m).__name__}:block_size={m.block_size}"
+                    + (
+                        f":win={m.sliding_window}"
+                        if getattr(m, "sliding_window", None)
+                        else ""
+                    )
+                    + (
+                        f":admission_cap={m._max_admission_blocks_per_request}"
+                        if getattr(m, "_max_admission_blocks_per_request", None)
+                        else ""
+                    )
+                    for i, m in enumerate(self.single_type_managers)
+                ),
+            )
         per_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
