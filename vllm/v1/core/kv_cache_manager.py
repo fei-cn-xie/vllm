@@ -400,14 +400,18 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
-        diag_reclaimed = (
-            diag_free_pre_reclaim - self.block_pool.get_num_free_blocks()
+        # freed = post - pre: remove_skipped_blocks RETURNS blocks to the
+        # pool, so free rises. (First version had the delta backwards and
+        # swallowed exactly this line -- the mm 131k run proved it: free
+        # jumped 1198->4711 inside this call with the log silent.)
+        diag_freed = (
+            self.block_pool.get_num_free_blocks() - diag_free_pre_reclaim
         )
-        if diag_reclaimed > 0:
+        if diag_freed > 0:
             logger.info(
-                "[lwd][diag] reclaim req=%s computed=%d reclaimed=%d "
+                "[lwd][diag] reclaim req=%s computed=%d freed=%d "
                 "free=%d->%d",
-                request.request_id, total_computed_tokens, diag_reclaimed,
+                request.request_id, total_computed_tokens, diag_freed,
                 diag_free_pre_reclaim,
                 self.block_pool.get_num_free_blocks(),
             )
@@ -428,7 +432,9 @@ class KVCacheManager:
         num_blocks_to_allocate = sum(diag_charge_by_group)
 
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        if num_new_tokens > 1 or full_sequence_must_fit:
+        # Prefill chunks only: decode steps carry new_tokens=2 (token +
+        # lookahead) and would flood with need~0 lines.
+        if num_new_tokens > 2:
             logger.info(
                 "[lwd][diag] chunk-alloc req=%s new_tokens=%d slot_tokens=%d "
                 "need=%d avail=%d -> %s groups=[%s]",
