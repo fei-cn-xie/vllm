@@ -103,7 +103,7 @@ def test_diag_package_purity():
     banned = (
         "control_edge_scheduler",
         "control_cloud_scheduler",
-        "control_communication",
+        "lwd_comm",
         "control_scheduler",
         "LwdBypassFuture",
         "LwdStubModelOutput",

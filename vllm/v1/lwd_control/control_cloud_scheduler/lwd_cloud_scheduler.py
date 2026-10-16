@@ -24,16 +24,16 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefill_notify_queue import (
     LwdPrefillNotifyQueue,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import (
-    LWD_NOT_FINISHED,
-    LwdC2eNotify,
-    LwdRangeItem,
-    LwdRangeNotify,
-)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
     lwd_spec_factor,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LWD_NOT_FINISHED,
+    LwdC2eNotify,
+    LwdRangeItem,
+    LwdRangeNotify,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 

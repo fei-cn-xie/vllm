@@ -23,6 +23,7 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
   | `vllm/v1/core/sched/phase_scheduler.py` | prefill_only 对照实验臂, 非 LWD 部署使用 |
   | `tools/lwd_check_budget.py`, `log_analyze_tools/lwd_*` | kernel 预算检查 / 日志分析工具 |
 
+- **控制面通信已替换**: 老的 pub/sub `control_communication/` 已由 `vllm/v1/lwd_control/lwd_comm/` (ROUTER/DEALER) 取代, 引擎接入在 `control_scheduler/lwd_base_engine.py`; 设计见 `docs/design/lwd_control_plane.md`. `docs/refactor/lwd_control_*.md` 描述的是替换前的结构.
 - **接入接缝**: 老代码经 `lwd_resolve_engine_cls` (engine 类按角色分流) 与 `lwd_serve_guard` (serve 入口注入云侧调度器) 两个钩子接入 vLLM; 另对 `v1/engine/core.py`、`v1/core/sched/scheduler.py`、`v1/worker/gpu_model_runner.py`、`distributed/parallel_state.py` 有侵入式改动.
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 

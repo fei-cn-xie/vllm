@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 
-from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRangeNotify
 
 
 class LwdPrefillNotifyQueue:
