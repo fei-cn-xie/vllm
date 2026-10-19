@@ -291,13 +291,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
             return False
         return True
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def _lwd_schedule_step(self) -> SchedulerOutput:
         """混排调度:每步四道门决策——条目对账(all-or-nothing)→ 提前收
         水位 → preflight 三检 → 混排步;任一门不过即本步 decode-only,
-        预告留队首下步重试。
-        throttle_prefills keeps the native step_with_batch_queue call
-        signature; the cloud gates below decide prefill admission
-        themselves (mm parity)."""
+        预告留队首下步重试。"""
         decode_ids = self._lwd_collect_decode_requests()
         notify = self.prefill_notify_queue.peek()
         if notify is not None:
