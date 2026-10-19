@@ -296,3 +296,13 @@ def test_mixed_encoding_file_fully_parsed(tmp_path: Path) -> None:
     assert rep.role == "edge"
     assert 0 in rep.chains and rep.chains[0].embed is not None
     assert rep.has_pending_requests is True
+
+
+def test_nfkc_folds_lookalikes(tmp_path: Path) -> None:
+    """全角数字/宽空格等"长得像"字符经 NFKC 折叠后必须能匹配。"""
+    path = tmp_path / "lookalike.log"
+    line = ("INFO [lwd] [LWD][edge-worker] EMBED seqno=\uff10 reqs=\uff11 "
+            "tokens=\uff11\u3000end").replace("seqno=\uff10", "seqno=0")
+    path.write_text(line + "\n", encoding="utf-8")
+    rep = triage.analyze(path, None)
+    assert 0 in rep.chains and rep.chains[0].embed is not None

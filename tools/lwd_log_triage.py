@@ -25,6 +25,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -64,10 +65,16 @@ def detect_encoding(path: Path, sample_bytes: int = 64 * 1024) -> str:
     return "utf-8"
 
 
+def _normalize(line: str) -> str:
+    """NFKC: fullwidth digits/letters and wide spaces fold to ASCII, so
+    lookalike characters from any transcoding hop cannot break matching."""
+    return unicodedata.normalize("NFKC", line).rstrip("\n\r")
+
+
 def iter_lines(path: Path, encoding: str | None = None) -> list[str]:
     encoding = encoding or detect_encoding(path)
     text = path.read_text(encoding=encoding, errors="replace")
-    return [line.rstrip("\n\r") for line in text.splitlines()]
+    return [_normalize(line) for line in text.splitlines()]
 
 
 def iter_lines_all_encodings(path: Path, encoding: str | None = None) -> list[list[str]]:
@@ -86,7 +93,7 @@ def iter_lines_all_encodings(path: Path, encoding: str | None = None) -> list[li
         if text in seen:
             continue
         seen.append(text)
-        result.append([line.rstrip("\n\r") for line in text.splitlines()])
+        result.append([_normalize(line) for line in text.splitlines()])
     return result
 
 
