@@ -67,16 +67,17 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
         self._lwd_hint_mq = create_hint_mq()
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
-        # The cloud endpoint rank returned its done-report MQ writer handle
-        # in the READY payload; the executor attached the reader. Pull it
-        # onto the engine - the drain below is engine-side.
-        self._lwd_done_mq = next(
-            (
-                handle.irecv_done_mq
-                for handle in self.model_executor.workers
-                if handle.irecv_done_mq is not None
-            ),
-            None,
+        # The cloud endpoint worker published its done-report MQ handle to
+        # the wire TCP store during init_device (same rendezvous the
+        # deployment already depends on); acquire the reader here - the
+        # workers are ready, so the key is set. This keeps the vllm
+        # executor entirely free of LWD plumbing.
+        from vllm.distributed.lwd import get_lwd_init_method
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import acquire_done_mq
+
+        assert self.vllm_config.lwd_config is not None
+        self._lwd_done_mq = acquire_done_mq(
+            get_lwd_init_method(self.vllm_config.lwd_config)
         )
         lwd_logger.info(
             "[pre-recv] hint MQ created by engine, done MQ attached: %s",

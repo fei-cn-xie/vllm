@@ -580,11 +580,6 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
-    # LWD pre-recv: MQ the cloud endpoint worker reports completed UP
-    # recvs on (worker builds the writer, the engine attaches the reader).
-    # Attached post-hoc by wait_for_ready; None on non-endpoint ranks and
-    # non-LWD deployments.
-    irecv_done_mq: MessageQueue | None = None
 
     @classmethod
     def from_unready_handle(
@@ -805,17 +800,9 @@ class WorkerProc:
                         raise e
 
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
-                    ready_handle = WorkerProc.wait_for_response_handle_ready(
+                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
-                    # LWD pre-recv: attach the worker-built done-report MQ
-                    # reader (cloud endpoint rank only; None elsewhere).
-                    irecv_done_handle = response.get("irecv_done_handle")
-                    if irecv_done_handle is not None:
-                        ready_handle.irecv_done_mq = MessageQueue.create_from_handle(
-                            irecv_done_handle, 0
-                        )
-                    ready_proc_handles[idx] = ready_handle
                 except EOFError:
                     e.__suppress_context__ = True
                     raise e from None
@@ -934,13 +921,6 @@ class WorkerProc:
                     "status": WorkerProc.READY_STR,
                     "handle": worker.worker_response_mq.export_handle(),
                     "peer_response_handles": worker.peer_response_handles,
-                    # LWD pre-recv: export the done-report MQ handle so the
-                    # engine can attach its reader (cloud endpoint only).
-                    "irecv_done_handle": (
-                        worker.worker.irecv_done_mq.export_handle()
-                        if getattr(worker.worker, "irecv_done_mq", None) is not None
-                        else None
-                    ),
                 }
             )
 
