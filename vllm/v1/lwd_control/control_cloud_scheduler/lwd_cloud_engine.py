@@ -186,6 +186,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     ) -> None:
         """Ingest thread: range notify -> notify queue + pre-recv hint;
         request notify -> native ADD."""
+        lwd_logger.info(
+            "[cloud] ingest msg=%s seqno=%s",
+            type(msg).__name__, getattr(msg, "seqno", "-"),
+        )
         # TODO(lwd): several edges per cloud DP rank need requests tracked by
         # the peer that owns them, issue #8.
         if isinstance(msg, LwdRangeNotify):
@@ -209,10 +213,18 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             aux_rows = 0
             # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
             # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
+            lwd_logger.info(
+                "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
+                msg.seqno, num_tokens, time.monotonic(),
+            )
             post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
+            lwd_logger.info(
+                "[cloud] request added req=%s tokens=%d",
+                msg.request_id, msg.num_prompt_tokens,
+            )
 
     def shutdown(self) -> None:
         # Before the executor goes: a pre-recv hint blocks on its queue.
@@ -292,7 +304,14 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 break
         if not items:
             return
-        record_irecv_completions(items)
+        advanced = record_irecv_completions(items)
+        lwd_logger.info(
+            "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
+            len(items),
+            sorted({s for _ch, s in items}),
+            sorted({s for _ch, s in advanced}) if advanced else "[]",
+            time.monotonic(),
+        )
 
     def post_step(self, model_executed: bool) -> None:
         """Flush pending c2e to the edge at the end of the step (the

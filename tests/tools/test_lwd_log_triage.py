@@ -19,6 +19,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import lwd_log_triage as triage  # noqa: E402
 
+
+# 完整链路段落(带新饱和打点),各用例按断点截取
+SEG_HINT = ("[Lwd][pre-recv] HINT seqno=0 num_tokens=11 ts=100.4")
+SEG_SUBMIT = ("[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
+              "aux_rows=0 inflight=1 queued=0 ts=100.5")
+SEG_DONE = "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9"
+SEG_REPORT = "[Lwd][pre-recv] REPORT channel=lwd_up seqno=0 ts=100.95"
+SEG_DRAIN = "[Lwd][pre-recv] DRAIN n=1 seqnos=[0] advanced=[0] ts=100.96"
+SEG_GATE_OPEN = "[cloud-sched] notify seqno=0 gate OPEN watermark=0"
+SEG_GATE_HOLD = "[cloud-sched] notify seqno=0 gate HOLD watermark=-1 (UP 未收齐;后续静默重试)"
+SEG_NOTIFY = "[cloud] ingest msg=LwdRangeNotify seqno=0"
+
+
 CLOUD_STARTUP_OK = [
     "(EngineCore pid=1) INFO [lwd_cloud_engine.py:60] [pre-recv] hint MQ "
     "created by engine, done MQ attached: OK",
@@ -100,7 +113,7 @@ VERDICT_CASES = [
     ),
     (
         "attached_none_connection",
-        CLOUD_STARTUP_OK[:0] + [
+        [
             "[pre-recv] hint MQ created by engine, done MQ attached: NONE",
             "[pre-recv] done MQ acquire from tcp://1.2.3.4:29600 failed "
             "(ConnectionRefusedError: [Errno 111] refused)",
@@ -132,78 +145,72 @@ VERDICT_CASES = [
         "控制面预告未达",
     ),
     (
+        "notify_without_hint",
+        CLOUD_STARTUP_OK + [SEG_NOTIFY],
+        None,
+        "hint 投递断",
+    ),
+    (
         "submit_missing",
-        CLOUD_STARTUP_OK + [
-            "[cloud-sched] notify seqno=0 deferred: request(s) not added yet",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT],
         None,
         "通信线程未消费",
     ),
     (
         "done_missing",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT],
         None,
         "UP irecv 未收齐",
     ),
     (
         "report_missing",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-            "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE],
         None,
         "完成上报未入",
     ),
     (
-        "gate_stuck_silent",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-            "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9",
-            "[Lwd][pre-recv] REPORT channel=lwd_up seqno=0 ts=100.95",
-        ],
+        "drain_missing",
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT],
         None,
-        "闸门/水位未生效",
+        "排水没跑",
+    ),
+    (
+        "gate_hold_after_drain",
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT,
+                            SEG_DRAIN, SEG_GATE_HOLD],
+        None,
+        "水位未推进",
+    ),
+    (
+        "gate_open_no_post",
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT,
+                            SEG_DRAIN, SEG_GATE_OPEN],
+        None,
+        "批未下发",
     ),
     (
         "add_not_landed",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-            "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9",
-            "[Lwd][pre-recv] REPORT channel=lwd_up seqno=0 ts=100.95",
-            "[cloud-sched] notify seqno=0 deferred: request(s) not added yet",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT,
+                            SEG_DRAIN, SEG_GATE_OPEN,
+                            "[cloud-sched] notify seqno=0 deferred: request(s) not added yet"],
         None,
         "ADD 未落地",
     ),
     (
         "preflight_rejected",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-            "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9",
-            "[Lwd][pre-recv] REPORT channel=lwd_up seqno=0 ts=100.95",
-            "[cloud-sched] notify seqno=0 deferred: preflight rejected "
-            "reqs=1 tokens=11",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT,
+                            SEG_DRAIN, SEG_GATE_OPEN,
+                            "[cloud-sched] notify seqno=0 deferred: preflight rejected "
+                            "reqs=1 tokens=11"],
         None,
         "preflight",
     ),
     (
         "chain_complete",
-        CLOUD_STARTUP_OK + [
-            "[Lwd][pre-recv] SUBMIT channel=lwd_up seqno=0 num_tokens=11 "
-            "aux_rows=0 inflight=1 queued=0 ts=100.5",
-            "[Lwd][pre-recv] DONE channel=lwd_up seqno=0 ts=100.9",
-            "[Lwd][pre-recv] REPORT channel=lwd_up seqno=0 ts=100.95",
-            "[Lwd][pre-recv] POST seqno=0 reqs=1 tokens=11 endpoint=True "
-            "ts=101.2 mem_alloc=1.00GiB",
-        ],
+        CLOUD_STARTUP_OK + [SEG_NOTIFY, SEG_HINT, SEG_SUBMIT, SEG_DONE, SEG_REPORT,
+                            SEG_DRAIN, SEG_GATE_OPEN,
+                            "[Lwd][pre-recv] POST seqno=0 reqs=1 tokens=11 "
+                            "endpoint=True ts=101.2 mem_alloc=1.00GiB"],
         None,
         "链路打点完整",
     ),
@@ -221,7 +228,7 @@ def test_verdict_names_the_broken_hop(
 
 def test_chain_hop_deltas_rendered(tmp_path: Path) -> None:
     verdicts = _run(tmp_path, VERDICT_CASES[-1][1], None)
-    assert any("submit→done=0.400s" in v for v in verdicts), verdicts
+    assert any("sub→done=0.400s" in v for v in verdicts), verdicts
 
 
 def test_edge_ladder_no_http_request(tmp_path: Path) -> None:

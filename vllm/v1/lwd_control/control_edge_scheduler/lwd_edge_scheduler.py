@@ -432,6 +432,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         seqno = self._lwd_seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
+        lwd_logger.info(
+            "[edge] range announced seqno=%d reqs=%d tokens=%d",
+            seqno, len(items), sum(i.num_tokens for i in items),
+        )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
         self._lwd_pending_batches[seqno] = set(req_ids)

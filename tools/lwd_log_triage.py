@@ -3,14 +3,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triage LWD bring-up logs: which hop of the pre-recv chain broke?
 
-Reads edge/cloud serve logs (encoding-adaptive: BOM, bare UTF-16, GBK,
-mixed line endings - never crashes), reconstructs the per-seqno chain
+Format baseline: branch lwd-debug-1019 (the saturated-INFO revision).
+Reconstructs the per-seqno chain
 
-    edge EMBED -> cloud notify -> worker SUBMIT -> DONE -> REPORT
-    -> gate opens (no more "pre-recv" deferrals) -> worker POST
+  edge request -> range announced -> EMBED (UP send)
+  -> cloud ingest -> HINT -> worker SUBMIT -> DONE -> REPORT
+  -> engine DRAIN -> gate OPEN -> worker POST -> c2e received
 
-and prints startup health plus a verdict per broken hop, so a hung
-request localizes to one segment instead of "cloud spins, edge waits".
+and prints startup health plus one verdict per broken hop. Reading is
+encoding-adaptive (BOM, bare UTF-16, GBK, CRLF, never crashes) AND has a
+byte-level fallback that scans the raw bytes in ASCII and UTF-16LE for
+every key marker, so no capture-wrapper encoding quirk can hide events.
 
 Usage:
     python3 tools/lwd_log_triage.py CLOUD.log [EDGE.log ...] [--encoding X] [--json]
@@ -25,14 +28,15 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+TOOL_VERSION = "v3 (format baseline: lwd-debug-1019)"
+
 # ---------------------------------------------------------------------- #
-# Encoding-adaptive reading (hard requirement; production logs are often
-# UTF-16 from PowerShell redirection, with or without BOM)
+# Encoding-adaptive reading
 # ---------------------------------------------------------------------- #
 _BOMS: tuple[tuple[bytes, str], ...] = (
     (b"\xff\xfe\x00\x00", "utf-32-le"),
     (b"\x00\x00\xfe\xff", "utf-32-be"),
-    (b"\xff\xfe", "utf-16"),  # BOM consumed by the codec
+    (b"\xff\xfe", "utf-16"),
     (b"\xfe\xff", "utf-16"),
     (b"\xef\xbb\xbf", "utf-8-sig"),
 )
@@ -44,7 +48,6 @@ def detect_encoding(path: Path, sample_bytes: int = 64 * 1024) -> str:
     for bom, encoding in _BOMS:
         if head.startswith(bom):
             return encoding
-    # Bare UTF-16 heuristic: NUL bytes on one parity of a printable sample.
     sample = head[: sample_bytes // 2]
     if sample and b"\x00" in sample:
         nul = float(sample.count(b"\x00")) / max(len(sample), 1)
@@ -58,7 +61,7 @@ def detect_encoding(path: Path, sample_bytes: int = 64 * 1024) -> str:
             return encoding
         except (UnicodeDecodeError, LookupError):
             continue
-    return "utf-8"  # caller reads with errors="replace"
+    return "utf-8"
 
 
 def iter_lines(path: Path, encoding: str | None = None) -> list[str]:
@@ -68,47 +71,45 @@ def iter_lines(path: Path, encoding: str | None = None) -> list[str]:
 
 
 def iter_lines_all_encodings(path: Path, encoding: str | None = None) -> list[list[str]]:
-    """Line lists from every plausible decoding, deduped by content.
-
-    Capture wrappers append later runs in a different encoding than the
-    BOM of the first run (seen live: UTF-16 head + UTF-8 request-period
-    tail in one file); a single-pass decode turns the appended part into
-    mojibake and every pattern misses it. The markers are bracketed and
-    highly specific, so scanning a few decodings and merging cannot
-    cross-match garbage.
-    """
+    """Line lists from every plausible decoding, deduped by content."""
     if encoding:
         return [iter_lines(path, encoding)]
     raw = path.read_bytes()
     primary = detect_encoding(path)
-    candidates = [primary, "utf-8", "utf-16-le", "utf-16-be"]
-    seen_texts: list[str] = []
+    seen: list[str] = []
     result: list[list[str]] = []
-    for candidate in dict.fromkeys(candidates):
+    for candidate in dict.fromkeys([primary, "utf-8", "utf-16-le", "utf-16-be"]):
         try:
             text = raw.decode(candidate, errors="replace")
         except LookupError:
             continue
-        if text in seen_texts:
+        if text in seen:
             continue
-        seen_texts.append(text)
+        seen.append(text)
         result.append([line.rstrip("\n\r") for line in text.splitlines()])
     return result
 
 
 # ---------------------------------------------------------------------- #
-# Log grammar (formats taken from the emitting code, not guessed)
+# Log grammar (formats from the emitting code on lwd-debug-1019)
 # ---------------------------------------------------------------------- #
 @dataclass
 class Chain:
     """Observable events for one seqno (ts from the shared monotonic clock)."""
 
-    embed: int | None = None          # edge line no.
-    notify: int | None = None         # cloud-sched saw the notify
-    submit: tuple[float, int] | None = None   # (ts, line no.)
+    edge_request: int | None = None
+    range_announced: int | None = None
+    embed: int | None = None
+    notify: int | None = None
+    hint: tuple[float, int] | None = None
+    submit: tuple[float, int] | None = None
     done: tuple[float, int] | None = None
     report: tuple[float, int] | None = None
+    drain: int | None = None
+    gate_hold: int | None = None
+    gate_open: int | None = None
     post: int | None = None
+    c2e: int | None = None
     defers: dict[str, int] = field(default_factory=dict)
 
 
@@ -124,30 +125,61 @@ _PATTERNS = {
         r"\[Lwd\]\[pre-recv\] comm thread starting rank=(\d+) hint MQ=(\w+)"
     ),
     "hint_dropped": re.compile(r"\[Lwd\]\[pre-recv\] HINT DROPPED: (.+)"),
+    "hint": re.compile(
+        r"\[Lwd\]\[pre-recv\] HINT seqno=(\d+) num_tokens=\d+ ts=([\d.]+)"
+    ),
     "submit": re.compile(r"\[Lwd\]\[pre-recv\] SUBMIT channel=\S+ seqno=(\d+).*ts=([\d.]+)"),
     "done": re.compile(r"\[Lwd\]\[pre-recv\] DONE channel=\S+ seqno=(\d+) ts=([\d.]+)"),
     "report": re.compile(r"\[Lwd\]\[pre-recv\] REPORT channel=\S+ seqno=(\d+) ts=([\d.]+)"),
+    "drain": re.compile(r"\[Lwd\]\[pre-recv\] DRAIN n=\d+ seqnos=\[([^\]]*)\]"),
     "post": re.compile(r"\[Lwd\]\[pre-recv\] POST seqno=(\d+) .*endpoint=True"),
+    "gate": re.compile(
+        r"\[cloud-sched\] notify seqno=(\d+) gate (OPEN|HOLD) watermark=(-?\d+)"
+    ),
+    "ingest": re.compile(r"\[cloud\] ingest msg=(\w+) seqno=(\S+)"),
+    "req_added": re.compile(r"\[cloud\] request added req=(\S+) tokens=(\d+)"),
+    "edge_request": re.compile(r"\[edge\] request received req=(\S+) tokens=(\d+)"),
+    "range_announced": re.compile(
+        r"\[edge\] range announced seqno=(\d+) reqs=(\d+) tokens=(\d+)"
+    ),
+    "embed": re.compile(r"\[LWD\]\[edge-worker\] EMBED seqno=(\d+) reqs=(\d+) tokens=(\d+)"),
+    "c2e": re.compile(r"\[edge\] c2e received reqs=(\d+) hidden_numel=(\d+)"),
     "defer": re.compile(
         r"\[cloud-sched\] notify seqno=(\d+) deferred: (.+?)\s*(?:reqs=|$)"
     ),
-    "embed": re.compile(r"\[LWD\]\[edge-worker\] EMBED seqno=(\d+) reqs=(\d+) tokens=(\d+)"),
     "engine_assembled": re.compile(r"\[cloud\] engine assembled: control plane on (\S+)"),
     "edge_assembled": re.compile(r"\[edge\] engine assembled: cloud \S+ at (\S+)"),
     "cloud_params": re.compile(r"\[cloud-params\] scheduling limits verified"),
     "http_post": re.compile(r'"POST /(v1/)?(chat/)?completions'),
     "has_work": re.compile(r"\[has_work\] engines_running=(\w+) has_requests=(\w+)"),
-    "channels": re.compile(r"data-plane channels created .*my_rank=(\d+), endpoints=(\S+)"),
     "warmup": re.compile(r"data-plane warmup done: channel=\S+ my_rank=(\d+) peer=(\d+)"),
     "port_down": re.compile(r"Communication_Error_Initialize_Transport|network port is down"),
     "gate_never": re.compile(r"pre-recv gate will never open"),
 }
 
+# Byte-level fallback: the raw bytes are decoded as ASCII with all other
+# bytes dropped, which flattens UTF-16LE/BE (NUL interleave removed) and
+# passes ASCII-compatible encodings through - every marker is pure ASCII,
+# so this single view sees them regardless of the capture encoding. Only
+# fills chain slots the decoded scans left empty, and never touches the
+# counters.
+_FLATTEN_EVENTS = {
+    "embed": _PATTERNS["embed"],
+    "range_announced": _PATTERNS["range_announced"],
+    "hint": _PATTERNS["hint"],
+    "submit": _PATTERNS["submit"],
+    "done": _PATTERNS["done"],
+    "report": _PATTERNS["report"],
+    "post": _PATTERNS["post"],
+}
+_FLATTEN_TS_SLOTS = {"hint", "submit", "done", "report"}
+
 _CLOUD_MARKERS = ("cloud-sched", "[cloud] engine assembled", "comm thread starting",
                   "LwdCloudEngine", "cloud-exec", "hint MQ created by engine",
-                  "done MQ attached")
+                  "done MQ attached", "[cloud] ingest")
 _EDGE_MARKERS = ("edge-worker", "EMBED seqno=", "LwdEdgeEngine",
-                 "[edge] engine assembled", "has_work")
+                 "[edge] engine assembled", "has_work", "[edge] request received",
+                 "range announced")
 
 
 @dataclass
@@ -160,6 +192,7 @@ class FileReport:
     encoding: str = ""
     http_posts: int = 0
     has_pending_requests: bool = False
+    byte_fallback_hits: int = 0
 
     def chain(self, seqno: int) -> Chain:
         return self.chains.setdefault(seqno, Chain())
@@ -176,6 +209,12 @@ def analyze(path: Path, encoding: str | None) -> FileReport:
 
     for lines in passes:
         _scan(lines, report)
+    _byte_fallback(path.read_bytes(), report)
+    if report.byte_fallback_hits:
+        report.startup.append(
+            f"字节级兜底命中 {report.byte_fallback_hits} 个事件(解码扫描漏掉,"
+            "行号以 B 标记)"
+        )
     return report
 
 
@@ -224,11 +263,34 @@ def _scan(lines: list[str], report: FileReport) -> None:
         m = _PATTERNS["warmup"].search(line)
         if m:
             note_startup(f"L{no}: warmup my_rank={m.group(1)} peer={m.group(2)}")
-        for key in ("submit", "done", "report"):
+        m = _PATTERNS["ingest"].search(line)
+        if m and m.group(1) == "LwdRangeNotify":
+            report.chain(int(m.group(2))).notify = (
+                report.chain(int(m.group(2))).notify or no
+            )
+        if _PATTERNS["req_added"].search(line):
+            report.has_pending_requests = True
+        if _PATTERNS["edge_request"].search(line):
+            for chain in report.chains.values():
+                if chain.edge_request is None:
+                    chain.edge_request = no
+        for key in ("hint", "submit", "done", "report"):
             m = _PATTERNS[key].search(line)
             if m:
                 seqno, ts = int(m.group(1)), float(m.group(2))
                 setattr(report.chain(seqno), key, (ts, no))
+        m = _PATTERNS["drain"].search(line)
+        if m:
+            for seqno_str in re.findall(r"\d+", m.group(1)):
+                report.chain(int(seqno_str)).drain = no
+        m = _PATTERNS["gate"].search(line)
+        if m:
+            chain = report.chain(int(m.group(1)))
+            if m.group(2) == "OPEN":
+                chain.gate_open = no
+            else:
+                chain.gate_hold = no
+            chain.notify = chain.notify or no
         m = _PATTERNS["post"].search(line)
         if m:
             report.chain(int(m.group(1))).post = no
@@ -238,15 +300,43 @@ def _scan(lines: list[str], report: FileReport) -> None:
             chain.notify = chain.notify or no
             reason = m.group(2).strip()
             chain.defers[reason] = chain.defers.get(reason, 0) + 1
+        m = _PATTERNS["range_announced"].search(line)
+        if m:
+            report.chain(int(m.group(1))).range_announced = no
         m = _PATTERNS["embed"].search(line)
         if m:
             report.chain(int(m.group(1))).embed = no
-    return report
+        if _PATTERNS["c2e"].search(line):
+            for chain in report.chains.values():
+                if chain.c2e is None:
+                    chain.c2e = no
+
+
+def _byte_fallback(raw: bytes, report: FileReport) -> None:
+    """ASCII-flattened fallback over the raw bytes.
+
+    Decoded-line scans can miss events to any capture-wrapper encoding
+    quirk (seen live); the flattened view cannot, because every marker is
+    pure ASCII. Fills only empty chain slots, never the counters.
+    """
+    flat = raw.decode("ascii", errors="ignore")
+    for line in flat.splitlines():
+        for slot, pattern in _FLATTEN_EVENTS.items():
+            m = pattern.search(line)
+            if not m:
+                continue
+            chain = report.chain(int(m.group(1)))
+            if getattr(chain, slot) is not None:
+                continue
+            if slot in _FLATTEN_TS_SLOTS:
+                setattr(chain, slot, (float(m.group(2)), -1))
+            else:
+                setattr(chain, slot, -1)
+            report.byte_fallback_hits += 1
 
 
 # ---------------------------------------------------------------------- #
-# Verdicts: first matching rule names the broken hop (matrix from the
-# 2026-10 bring-up; each rule cites the observable it keys on)
+# Verdicts: first matching rule names the broken hop
 # ---------------------------------------------------------------------- #
 def verdicts(reports: list[FileReport]) -> list[str]:
     out: list[str] = []
@@ -270,13 +360,18 @@ def verdicts(reports: list[FileReport]) -> list[str]:
         out.append("[启动] worker 未 attach hint MQ: 环境变量句柄未随 spawn 传递")
     for seqno, chain in sorted(cloud.chains.items()):
         tag = f"[seqno={seqno}]"
-        edge_seen = edge is not None and seqno in edge.chains and edge.chains[seqno].embed
         if not chain.notify and not chain.submit and not chain.post:
+            edge_seen = edge is not None and seqno in edge.chains and (
+                edge.chains[seqno].embed or edge.chains[seqno].range_announced
+            )
             if edge_seen:
-                out.append(f"{tag} 边已 EMBED 但云无任何事件: 控制面预告未达引擎(ingest/ZMQ)")
+                out.append(f"{tag} 边已发批但云 ingest 无此 seqno: 控制面预告未达云引擎(ZMQ)")
             continue
-        if chain.notify and not chain.submit and not chain.post:
-            out.append(f"{tag} 预告已到引擎,worker 无 SUBMIT: 通信线程未消费 hint MQ")
+        if chain.notify and not chain.hint and not chain.submit:
+            out.append(f"{tag} 预告已 ingest 但无 HINT: 引擎侧 hint 投递断(sender/MQ)")
+            continue
+        if chain.hint and not chain.submit:
+            out.append(f"{tag} 已 HINT 无 SUBMIT: worker 通信线程未消费 hint MQ")
             continue
         if chain.submit and not chain.done:
             out.append(f"{tag} 已 SUBMIT 未 DONE: UP irecv 未收齐(数据面尺寸/通道)")
@@ -284,30 +379,36 @@ def verdicts(reports: list[FileReport]) -> list[str]:
         if chain.done and not chain.report:
             out.append(f"{tag} 已 DONE 未 REPORT: 完成上报未入 done MQ")
             continue
-        # The scheduler's pre-recv gate defers silently (no log line), so
-        # its signature is: reported, no POST, no logged defer reason.
-        if chain.report and not chain.post and not chain.defers:
-            out.append(f"{tag} 已 REPORT 无 POST 且无放行日志: 闸门/水位未生效(引擎排水或 is_irecv_complete)")
+        if chain.report and not chain.drain:
+            out.append(f"{tag} 已 REPORT 未 DRAIN: 引擎排水没跑(done MQ 未挂/排水未调用)")
+            continue
+        if chain.drain and chain.gate_hold and not chain.gate_open:
+            out.append(f"{tag} 已 DRAIN 但闸门 HOLD: 水位未推进到该 seqno(advanced 空?)")
             continue
         if any("not added" in r for r in chain.defers):
             out.append(f"{tag} 预告到达但请求 ADD 未落地: input_queue 次序问题")
+            continue
+        if chain.gate_open and not chain.post:
+            out.append(f"{tag} 闸门已 OPEN 无 POST: 放行后批未下发(preflight/调度)")
             continue
         if any("preflight" in r for r in chain.defers):
             out.append(f"{tag} 闸门已过但 preflight 拒绝: 预算/名额/KV 调度参数")
             continue
         if chain.post:
             hops = []
+            if chain.hint and chain.submit:
+                hops.append(f"hint→sub={chain.submit[0] - chain.hint[0]:.3f}s")
             if chain.submit and chain.done:
-                hops.append(f"submit→done={chain.done[0] - chain.submit[0]:.3f}s")
+                hops.append(f"sub→done={chain.done[0] - chain.submit[0]:.3f}s")
             out.append(f"{tag} 链路打点完整(POST 已达前向, {', '.join(hops)}): 查前向/DOWN 回程")
     if not cloud.chains:
         edge_embeds = sorted(
             seqno for seqno, chain in (edge.chains if edge else {}).items()
-            if chain.embed
+            if chain.embed or chain.range_announced
         )
         if edge_embeds:
             out.append(
-                f"云日志无任何 seqno 事件,但边已 EMBED seqno={edge_embeds}: "
+                f"云日志无任何 seqno 事件,但边已发批 seqno={edge_embeds}: "
                 "控制面预告未达云引擎(ingest/ZMQ)"
             )
         elif cloud.http_posts:
@@ -321,7 +422,7 @@ def verdicts(reports: list[FileReport]) -> list[str]:
         elif edge is not None and edge.http_posts and not edge.has_pending_requests:
             out.append("边收到 HTTP 请求但引擎未消费(has_work 无 pending): "
                        "API server 到 EngineCore 的通路问题")
-        elif edge is not None and edge.has_pending_requests and not edge_embeds:
+        elif edge is not None and edge.has_pending_requests:
             out.append("边引擎已持有请求但未出 EMBED 批: 边侧调度(picker/EMBED 出批)问题")
         else:
             out.append("云日志中无任何 seqno 事件: 请求未到达云侧(或日志不含请求期)")
@@ -333,6 +434,7 @@ def render(reports: list[FileReport], as_json: bool) -> str:
     if as_json:
         return json.dumps(
             {
+                "tool_version": TOOL_VERSION,
                 "files": [
                     {
                         "path": str(r.path),
@@ -340,13 +442,9 @@ def render(reports: list[FileReport], as_json: bool) -> str:
                         "encoding": r.encoding,
                         "startup": r.startup,
                         "errors": r.errors,
+                        "byte_fallback_hits": r.byte_fallback_hits,
                         "chains": {
-                            str(k): {
-                                "embed": v.embed, "notify": v.notify, "post": v.post,
-                                "submit": v.submit, "done": v.done, "report": v.report,
-                                "defers": v.defers,
-                            }
-                            for k, v in r.chains.items()
+                            str(k): vars(v) for k, v in r.chains.items()
                         },
                     }
                     for r in reports
@@ -356,7 +454,7 @@ def render(reports: list[FileReport], as_json: bool) -> str:
             ensure_ascii=False,
             indent=2,
         )
-    parts = []
+    parts = [f"== lwd_log_triage {TOOL_VERSION} =="]
     for r in reports:
         parts.append(f"== {r.path} (role={r.role}, encoding={r.encoding}) ==")
         if r.startup:
@@ -372,7 +470,7 @@ def render(reports: list[FileReport], as_json: bool) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("logs", type=Path, nargs="+", help="edge/cloud serve 日志文件")
-    parser.add_argument("--encoding", help="强制指定日志编码(默认自适应)")
+    parser.add_argument("--encoding", help="强制指定日志编码(默认自适应+字节兜底)")
     parser.add_argument("--json", action="store_true", help="机读输出")
     args = parser.parse_args(argv)
     reports = []
