@@ -62,6 +62,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        # The prefill-only edge runs no transformer layers, so it holds zero
+        # cacheable KV groups; the KV cache coordinator (upstream and the
+        # Ascend patch) asserts "requires at least one cacheable group" while
+        # caching is on. Disable prefix caching before the native engine
+        # builds it — the same situation the upstream config handles for
+        # encoder-only instances, kept here to leave that file untouched.
+        cache_config = kwargs["vllm_config"].cache_config
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+        super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
+
     def _lwd_assemble(self) -> None:
         self._lwd_cloud_params: LwdCloudParamsNotify | None = None
         self._lwd_cloud_params_received = threading.Event()

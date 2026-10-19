@@ -1997,21 +1997,6 @@ class VllmConfig:
             )
             self.cache_config.enable_prefix_caching = False
 
-        if (
-            self.lwd_config is not None
-            and self.lwd_config.role == "edge"
-            and self.cache_config.enable_prefix_caching
-        ):
-            # Same situation as the encoder-only instance above: the
-            # prefill-only LWD edge forwards prompt embeds and runs no
-            # transformer layers, so it holds no cacheable KV group and the
-            # hybrid coordinator (upstream and Ascend) asserts on zero
-            # cacheable groups.
-            logger.info(
-                "[LWD] Disabling prefix caching: the edge holds no KV cache."
-            )
-            self.cache_config.enable_prefix_caching = False
-
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
         #   disables it
