@@ -168,26 +168,6 @@ class MultiprocExecutor(Executor):
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
-        # LWD pre-recv (cloud only): sideband hint MQ the engine feeds
-        # receive hints into. It must NOT ride rpc_broadcast_mq - that one
-        # is drained by the worker's single-threaded busy loop, which sits
-        # inside a several-hundred-ms prefill forward; hints queued behind
-        # it would lose the whole point of pre-posting the receive. The
-        # handle rides the environment, so create it before workers spawn.
-        self.lwd_recv_hint_mq: MessageQueue | None = None
-        self.lwd_irecv_done_mq: MessageQueue | None = None
-        lwd_config = self.vllm_config.lwd_config
-        if lwd_config is not None and lwd_config.role == "cloud":
-            from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
-                create_hint_mq,
-            )
-
-            self.lwd_recv_hint_mq = create_hint_mq()
-            logger.info(
-                "[LWD][pre-recv] hint MQ created on cloud executor "
-                "(local_world_size=%d)",
-                self.local_world_size,
-            )
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -232,22 +212,6 @@ class MultiprocExecutor(Executor):
 
             # Wait for all local workers to be ready.
             self.workers = WorkerProc.wait_for_ready(unready_workers)
-
-            # LWD pre-recv: attach the done-report MQ reader from the cloud
-            # endpoint rank's READY payload (only that rank builds one).
-            if self.lwd_recv_hint_mq is not None:
-                self.lwd_irecv_done_mq = next(
-                    (
-                        worker.irecv_done_mq
-                        for worker in self.workers
-                        if worker.irecv_done_mq is not None
-                    ),
-                    None,
-                )
-                logger.info(
-                    "[LWD][pre-recv] done MQ attached on cloud executor: %s",
-                    "OK" if self.lwd_irecv_done_mq is not None else "NONE",
-                )
 
             # The workers have inherited their thread count (see
             # set_multiprocessing_worker_envs); this process only schedules, so
@@ -618,7 +582,8 @@ class WorkerProcHandle:
     death_writer: Connection | None = None
     # LWD pre-recv: MQ the cloud endpoint worker reports completed UP
     # recvs on (worker builds the writer, the engine attaches the reader).
-    # None on non-endpoint ranks and non-LWD deployments.
+    # Attached post-hoc by wait_for_ready; None on non-endpoint ranks and
+    # non-LWD deployments.
     irecv_done_mq: MessageQueue | None = None
 
     @classmethod
@@ -627,7 +592,6 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
-        irecv_done_mq: MessageQueue | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -635,7 +599,6 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
-            irecv_done_mq=irecv_done_mq,
         )
 
 
@@ -645,10 +608,6 @@ class WorkerProc:
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
-    # LWD pre-recv: writer handle of the done-report MQ, exported in the
-    # READY payload. Filled after init_device() built it (cloud endpoint
-    # rank only); None elsewhere.
-    irecv_done_mq: MessageQueue | None = None
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
@@ -743,10 +702,6 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
-        # LWD pre-recv: the cloud endpoint worker built the done-report MQ
-        # (writer) during init_device; pick it up for the READY payload.
-        self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
-
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -819,17 +774,10 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
-        # LWD pre-recv: the worker-built done-report MQ (one reader, one
-        # writer); attach the reader side here.
-        irecv_done_handle = handles.get("irecv_done_handle")
-        irecv_done_mq: MessageQueue | None = None
-        if irecv_done_handle is not None:
-            irecv_done_mq = MessageQueue.create_from_handle(irecv_done_handle, 0)
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
-            irecv_done_mq=irecv_done_mq,
         )
 
     @staticmethod
@@ -857,9 +805,17 @@ class WorkerProc:
                         raise e
 
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
-                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
+                    ready_handle = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
+                    # LWD pre-recv: attach the worker-built done-report MQ
+                    # reader (cloud endpoint rank only; None elsewhere).
+                    irecv_done_handle = response.get("irecv_done_handle")
+                    if irecv_done_handle is not None:
+                        ready_handle.irecv_done_mq = MessageQueue.create_from_handle(
+                            irecv_done_handle, 0
+                        )
+                    ready_proc_handles[idx] = ready_handle
                 except EOFError:
                     e.__suppress_context__ = True
                     raise e from None
@@ -979,10 +935,10 @@ class WorkerProc:
                     "handle": worker.worker_response_mq.export_handle(),
                     "peer_response_handles": worker.peer_response_handles,
                     # LWD pre-recv: export the done-report MQ handle so the
-                    # executor can attach its reader (cloud endpoint only).
+                    # engine can attach its reader (cloud endpoint only).
                     "irecv_done_handle": (
-                        worker.irecv_done_mq.export_handle()
-                        if worker.irecv_done_mq is not None
+                        worker.worker.irecv_done_mq.export_handle()
+                        if getattr(worker.worker, "irecv_done_mq", None) is not None
                         else None
                     ),
                 }

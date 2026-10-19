@@ -55,6 +55,34 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
 
+    def __init__(self, *args: Any, lwd_dp_size: int, **kwargs: Any) -> None:
+        # Pre-recv hint MQ must exist before super().__init__ spawns the
+        # executor workers (same process): create_hint_mq() publishes the
+        # handle through the environment, and only processes spawned after
+        # that see it. The sideband MQ exists because rpc_broadcast_mq is
+        # drained by the worker's single-threaded busy loop, which sits
+        # inside a several-hundred-ms prefill forward - hints queued behind
+        # it would lose the whole point of pre-posting the receive.
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import create_hint_mq
+
+        self._lwd_hint_mq = create_hint_mq()
+        super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
+        # The cloud endpoint rank returned its done-report MQ writer handle
+        # in the READY payload; the executor attached the reader. Pull it
+        # onto the engine - the drain below is engine-side.
+        self._lwd_done_mq = next(
+            (
+                handle.irecv_done_mq
+                for handle in self.model_executor.workers
+                if handle.irecv_done_mq is not None
+            ),
+            None,
+        )
+        lwd_logger.info(
+            "[pre-recv] hint MQ created by engine, done MQ attached: %s",
+            "OK" if self._lwd_done_mq is not None else "NONE",
+        )
+
     def _lwd_assemble(self) -> None:
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
@@ -112,12 +140,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
 
     def _lwd_register_recv_hint(self) -> None:
-        """[Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
-        通信线程。走 executor 上的旁路 MQ(不是 rpc_broadcast_mq:那条由
-        busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
-        "早"不起来了)。引擎在 super().__init__ 里就把 executor 建好了,
-        故此处直接取。"""
-        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
+        """[LWD][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker
+        通信线程。走本引擎在 __init__ 里建的旁路 MQ(不是 rpc_broadcast_mq:
+        那条由 busy_loop 单线程消费,会被几百毫秒的 prefill 前向堵住,提示就
+        "早"不起来了)。"""
+        hint_mq = self._lwd_hint_mq
         if hint_mq is not None:
             from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
                 register_hint_sender,
@@ -245,7 +272,7 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
     def _lwd_drain_irecv_completions(self) -> None:
         """每步排空 done MQ,把 worker 收完的 UP recv 并进提前收水位(闸门就绪判据)。"""
-        done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
+        done_mq = getattr(self, "_lwd_done_mq", None)
         if done_mq is None:
             return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
