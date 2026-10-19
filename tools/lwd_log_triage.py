@@ -104,6 +104,10 @@ _PATTERNS = {
     ),
     "embed": re.compile(r"\[LWD\]\[edge-worker\] EMBED seqno=(\d+) reqs=(\d+) tokens=(\d+)"),
     "engine_assembled": re.compile(r"\[cloud\] engine assembled: control plane on (\S+)"),
+    "edge_assembled": re.compile(r"\[edge\] engine assembled: cloud \S+ at (\S+)"),
+    "cloud_params": re.compile(r"\[cloud-params\] scheduling limits verified"),
+    "http_post": re.compile(r'"POST /(v1/)?(chat/)?completions'),
+    "has_work": re.compile(r"\[has_work\] engines_running=(\w+) has_requests=(\w+)"),
     "channels": re.compile(r"data-plane channels created .*my_rank=(\d+), endpoints=(\S+)"),
     "warmup": re.compile(r"data-plane warmup done: channel=\S+ my_rank=(\d+) peer=(\d+)"),
     "port_down": re.compile(r"Communication_Error_Initialize_Transport|network port is down"),
@@ -113,7 +117,8 @@ _PATTERNS = {
 _CLOUD_MARKERS = ("cloud-sched", "[cloud] engine assembled", "comm thread starting",
                   "LwdCloudEngine", "cloud-exec", "hint MQ created by engine",
                   "done MQ attached")
-_EDGE_MARKERS = ("edge-worker", "EMBED seqno=", "LwdEdgeEngine")
+_EDGE_MARKERS = ("edge-worker", "EMBED seqno=", "LwdEdgeEngine",
+                 "[edge] engine assembled", "has_work")
 
 
 @dataclass
@@ -124,6 +129,8 @@ class FileReport:
     errors: list[str] = field(default_factory=list)
     chains: dict[int, Chain] = field(default_factory=dict)
     encoding: str = ""
+    http_posts: int = 0
+    has_pending_requests: bool = False
 
     def chain(self, seqno: int) -> Chain:
         return self.chains.setdefault(seqno, Chain())
@@ -165,6 +172,16 @@ def analyze(path: Path, encoding: str | None) -> FileReport:
         m = _PATTERNS["engine_assembled"].search(line)
         if m:
             report.startup.append(f"L{no}: control plane on {m.group(1)}")
+        m = _PATTERNS["edge_assembled"].search(line)
+        if m:
+            report.startup.append(f"L{no}: edge assembled, cloud at {m.group(1)}")
+        if _PATTERNS["cloud_params"].search(line):
+            report.startup.append(f"L{no}: cloud scheduling limits verified (边云握手闭环)")
+        if _PATTERNS["http_post"].search(line):
+            report.http_posts += 1
+        m = _PATTERNS["has_work"].search(line)
+        if m and m.group(2) == "True":
+            report.has_pending_requests = True
         m = _PATTERNS["warmup"].search(line)
         if m:
             report.startup.append(f"L{no}: warmup my_rank={m.group(1)} peer={m.group(2)}")
@@ -254,6 +271,14 @@ def verdicts(reports: list[FileReport]) -> list[str]:
                 f"云日志无任何 seqno 事件,但边已 EMBED seqno={edge_embeds}: "
                 "控制面预告未达云引擎(ingest/ZMQ)"
             )
+        elif edge is not None and not edge.http_posts:
+            out.append("两份日志均无请求期事件,且边侧无 HTTP 请求记录: "
+                       "请求未打到边或日志不含请求期(先发请求再抓全量日志)")
+        elif edge is not None and edge.http_posts and not edge.has_pending_requests:
+            out.append("边收到 HTTP 请求但引擎未消费(has_work 无 pending): "
+                       "API server 到 EngineCore 的通路问题")
+        elif edge is not None and edge.has_pending_requests and not edge_embeds:
+            out.append("边引擎已持有请求但未出 EMBED 批: 边侧调度(picker/EMBED 出批)问题")
         else:
             out.append("云日志中无任何 seqno 事件: 请求未到达云侧(或日志不含请求期)")
     out.extend(f"[错误] {e}" for e in cloud.errors)
@@ -290,7 +315,10 @@ def render(reports: list[FileReport], as_json: bool) -> str:
     parts = []
     for r in reports:
         parts.append(f"== {r.path} (role={r.role}, encoding={r.encoding}) ==")
-        parts.extend(f"  {s}" for s in r.startup) or parts.append("  (无启动段标记)")
+        if r.startup:
+            parts.extend(f"  {s}" for s in r.startup)
+        else:
+            parts.append("  (无启动段标记)")
         parts.append("")
     parts.append("== 结论 ==")
     parts.extend(f"  {v}" for v in verdicts(reports))

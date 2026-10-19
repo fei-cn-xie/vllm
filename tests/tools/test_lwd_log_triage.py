@@ -222,3 +222,40 @@ def test_verdict_names_the_broken_hop(
 def test_chain_hop_deltas_rendered(tmp_path: Path) -> None:
     verdicts = _run(tmp_path, VERDICT_CASES[-1][1], None)
     assert any("submit→done=0.400s" in v for v in verdicts), verdicts
+
+
+def test_edge_ladder_no_http_request(tmp_path: Path) -> None:
+    edge = [
+        "[edge] engine assembled: cloud LwdPeer at tcp://1.2.3.4:5550, "
+        "native batch-queue stepping depth=2",
+    ]
+    verdicts = _run(tmp_path, CLOUD_STARTUP_OK, edge)
+    assert any("请求未打到边" in v for v in verdicts), verdicts
+
+
+def test_edge_ladder_http_but_engine_idle(tmp_path: Path) -> None:
+    edge = [
+        'INFO:     76.76.26.17:38222 - "POST /v1/chat/completions HTTP/1.1" 200',
+        "[has_work] engines_running=False has_requests=False batch_queue=False",
+    ]
+    verdicts = _run(tmp_path, CLOUD_STARTUP_OK, edge)
+    assert any("引擎未消费" in v for v in verdicts), verdicts
+
+
+def test_edge_ladder_pending_but_no_embed(tmp_path: Path) -> None:
+    edge = [
+        'INFO:     76.76.26.17:38222 - "POST /v1/chat/completions HTTP/1.1" 200',
+        "[has_work] engines_running=False has_requests=True batch_queue=False",
+    ]
+    verdicts = _run(tmp_path, CLOUD_STARTUP_OK, edge)
+    assert any("未出 EMBED 批" in v for v in verdicts), verdicts
+
+
+def test_render_no_placeholder_when_startup_present(tmp_path: Path) -> None:
+    cloud = tmp_path / "c.log"
+    cloud.write_text(
+        "[pre-recv] hint MQ created by engine, done MQ attached: OK\n",
+        encoding="utf-8",
+    )
+    text = triage.render([triage.analyze(cloud, None)], as_json=False)
+    assert "无启动段标记" not in text
