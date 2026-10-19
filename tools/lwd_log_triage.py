@@ -271,6 +271,11 @@ def verdicts(reports: list[FileReport]) -> list[str]:
                 f"云日志无任何 seqno 事件,但边已 EMBED seqno={edge_embeds}: "
                 "控制面预告未达云引擎(ingest/ZMQ)"
             )
+        elif cloud.http_posts:
+            out.append(
+                "请求打到了云侧的闲置 API server(云前端直连云引擎,不经边): "
+                "客户端目标错了,应打 边IP:边端口"
+            )
         elif edge is not None and not edge.http_posts:
             out.append("两份日志均无请求期事件,且边侧无 HTTP 请求记录: "
                        "请求未打到边或日志不含请求期(先发请求再抓全量日志)")

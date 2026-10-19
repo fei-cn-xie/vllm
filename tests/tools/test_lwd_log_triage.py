@@ -259,3 +259,13 @@ def test_render_no_placeholder_when_startup_present(tmp_path: Path) -> None:
     )
     text = triage.render([triage.analyze(cloud, None)], as_json=False)
     assert "无启动段标记" not in text
+
+
+def test_request_hit_cloud_idle_frontend(tmp_path: Path) -> None:
+    """请求误打云侧闲置 API server:云有 POST 行、边没有,且无任何 seqno 事件。"""
+    cloud = CLOUD_STARTUP_OK + [
+        'INFO:     76.76.26.17:38222 - "POST /v1/chat/completions HTTP/1.1" 200',
+    ]
+    edge = ["[edge] engine assembled: cloud LwdPeer at tcp://1.2.3.4:5550, depth=2"]
+    verdicts = _run(tmp_path, cloud, edge)
+    assert any("闲置 API server" in v for v in verdicts), verdicts
