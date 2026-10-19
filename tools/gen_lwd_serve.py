@@ -158,7 +158,10 @@ def cloud_script(args: argparse.Namespace, topology: Path) -> str:
         *common_flags(args, topology),
         "--pipeline-parallel-size 1",
         flag("--tensor-parallel-size", len(args.cloud_devices.split(","))),
-        "--headless",
+        # NOT --headless: headless expects an external LB supervisor to answer
+        # the engine startup handshake; standalone, engines time out after 5
+        # minutes. A plain (unused) API server on its own port answers it.
+        flag("--port", args.cloud_http_port),
         flag("--additional-config", additional_config(topology, "cloud")),
         flag("--compilation-config", cudagraph_config(args.cloud_cudagraph_mode, sizes)),
     ]
@@ -203,6 +206,10 @@ def parse_args() -> argparse.Namespace:
     deploy.add_argument("--master-addr", default=None, help="default: edge ip")
     deploy.add_argument("--master-port", type=int, default=29600)
     deploy.add_argument("--edge-http-port", type=int, default=9724)
+    deploy.add_argument("--cloud-http-port", type=int, default=9725,
+                        help="cloud's own API server port; unused by clients, "
+                        "but the front-end must run to answer the engine "
+                        "startup handshake")
     deploy.add_argument("--ctrl-port-base", type=int, default=5550, help="cloud control-plane port in the topology")
     deploy.add_argument("--model", default="/weight/Qwen3.6-27B/")
     deploy.add_argument("--served-name", default="qwen3.6")

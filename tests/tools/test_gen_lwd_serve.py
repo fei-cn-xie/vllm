@@ -85,13 +85,16 @@ def test_edge_script_bakes_role_topology_and_single_card(
     }
 
 
-def test_cloud_script_derives_tp_headless_and_spec(tmp_path: Path) -> None:
+def test_cloud_script_derives_tp_and_keeps_a_frontend(tmp_path: Path) -> None:
     _, cloud, topology = generated(tmp_path / "out")
     assert f"export VLLM_HOST_IP={CLOUD_IP}" in cloud
     assert "export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in cloud
     assert "--tensor-parallel-size 8" in cloud
     assert "--pipeline-parallel-size 1" in cloud
-    assert "--headless" in cloud
+    # --headless would starve the engine startup handshake (it expects an
+    # external LB supervisor); the cloud keeps its own front-end instead.
+    assert "--headless" not in cloud
+    assert "--port 9725" in cloud
     spec = re.search(r"--speculative-config '(\{.*?\})'", cloud)
     assert spec is not None, "speculative config missing"
     assert json.loads(spec.group(1))["num_speculative_tokens"] == 3
