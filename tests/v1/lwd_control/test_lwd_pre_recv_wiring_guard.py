@@ -16,6 +16,26 @@ The non-invasive split being pinned here:
   environment), registers the sender against its own MQ, and collects the
   done MQ from the executor's public worker handles.
 
+Equivalence mapping vs the executor-owned version (babc9a14c7), kept
+here per the refactor rule that unstated equivalence is untrusted:
+- hint MQ created before worker spawn in BOTH versions (executor init vs
+  engine __init__ before super) - the env handle reaches the same
+  spawned workers either way;
+- the cloud-role gate moved from an explicit role check in the executor
+  to the engine-class/role correspondence: run_engine_core selects
+  LwdCloudEngineCore only for role=="cloud" and the topology schema
+  admits only edge/cloud, so an unconditional create in this class is
+  the same predicate. test_cloud_engine_class_is_cloud_role_only pins
+  the selection site;
+- done-MQ handle bytes are identical (same export_handle()); attaching
+  by post-hoc setattr equals the old constructor parameter because the
+  dataclass is not frozen, and the setattr happens in the same
+  single-threaded ready loop, before the handle is published in
+  ready_proc_handles;
+- the drain reads the engine-owned MQ instead of the executor attribute:
+  the only consumer moved in the same commit, and engine and executor
+  share the process and lifetime.
+
 AST source-scan form, no torch required.
 """
 
@@ -34,6 +54,7 @@ ENGINE = (
     / "control_cloud_scheduler"
     / "lwd_cloud_engine.py"
 )
+CORE = VLLM_ROOT / "vllm" / "v1" / "engine" / "core.py"
 
 
 def _source(path: Path) -> str:
@@ -97,4 +118,20 @@ def test_engine_owns_hint_and_done_mqs() -> None:
     )
     assert 'getattr(self, "_lwd_done_mq", None)' in src, (
         "the drain must read the engine-owned done MQ"
+    )
+
+
+def test_cloud_engine_class_is_cloud_role_only() -> None:
+    """Pin the selection site the unconditional create_hint_mq relies on:
+    LwdCloudEngineCore is instantiated only for role=="cloud" (and the
+    topology schema admits only edge/cloud), which is what makes the
+    engine-owned hint MQ equivalent to the executor's old explicit
+    role check."""
+    src = _source(CORE)
+    assert 'lwd.role == "edge"' in src, (
+        "run_engine_core lost the role split that guarantees the cloud "
+        "engine class is cloud-only"
+    )
+    assert "LwdCloudEngineCore" in src, (
+        "run_engine_core no longer selects LwdCloudEngineCore"
     )
