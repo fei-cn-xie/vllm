@@ -134,9 +134,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (原生批队列契约,空批会以 None 结果炸收割路径)。"""
         return bool(self.unembed_notify_queue) or self._lwd_embed_dispatchable()
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """EMBED 优先出批,否则消费 c2e 出 UNEMBED 批(先收尾再开新,
-        防 EMBED 被 decode 回程挤出深度配额)。"""
+        防 EMBED 被 decode 回程挤出深度配额)。
+        throttle_prefills keeps the native step_with_batch_queue call
+        signature; the edge flow does not consume the hint (mm parity)."""
         LwdControlDiag.edge_step_activity(
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
