@@ -182,7 +182,7 @@ def analyze(path: Path, encoding: str | None) -> FileReport:
 def _scan(lines: list[str], report: FileReport) -> None:
     def note_startup(entry: str) -> None:
         if entry not in report.startup:
-            note_startup(entry)
+            report.startup.append(entry)
 
     for no, line in enumerate(lines, 1):
         if _PATTERNS["port_down"].search(line):
