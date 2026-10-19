@@ -269,3 +269,23 @@ def test_request_hit_cloud_idle_frontend(tmp_path: Path) -> None:
     edge = ["[edge] engine assembled: cloud LwdPeer at tcp://1.2.3.4:5550, depth=2"]
     verdicts = _run(tmp_path, cloud, edge)
     assert any("闲置 API server" in v for v in verdicts), verdicts
+
+
+def test_mixed_encoding_file_fully_parsed(tmp_path: Path) -> None:
+    """复现真机形态:UTF-16 BOM 头(启动段) + 原生 UTF-8 追加段(请求期)。
+    单遍按 BOM 解码会把追加段变乱码、EMBED 全部丢失。"""
+    head = "\n".join([
+        "INFO data-plane warmup done: channel=UP my_rank=0 peer=1",
+        "INFO [cloud-params] scheduling limits verified",
+    ])
+    tail = "\n".join([
+        "INFO [lwd] [has_work] engines_running=False has_requests=True batch_queue=False",
+        "INFO [lwd] [LWD][edge-worker] EMBED seqno=0 reqs=1 tokens=11 has_mrope=[False]",
+        "[END] 2026/10/19 19:58:48",
+    ])
+    path = tmp_path / "mixed.log"
+    path.write_bytes(b"\xff\xfe" + head.encode("utf-16-le") + b"\n\0" + tail.encode("utf-8"))
+    rep = triage.analyze(path, None)
+    assert rep.role == "edge"
+    assert 0 in rep.chains and rep.chains[0].embed is not None
+    assert rep.has_pending_requests is True

@@ -67,6 +67,35 @@ def iter_lines(path: Path, encoding: str | None = None) -> list[str]:
     return [line.rstrip("\n\r") for line in text.splitlines()]
 
 
+def iter_lines_all_encodings(path: Path, encoding: str | None = None) -> list[list[str]]:
+    """Line lists from every plausible decoding, deduped by content.
+
+    Capture wrappers append later runs in a different encoding than the
+    BOM of the first run (seen live: UTF-16 head + UTF-8 request-period
+    tail in one file); a single-pass decode turns the appended part into
+    mojibake and every pattern misses it. The markers are bracketed and
+    highly specific, so scanning a few decodings and merging cannot
+    cross-match garbage.
+    """
+    if encoding:
+        return [iter_lines(path, encoding)]
+    raw = path.read_bytes()
+    primary = detect_encoding(path)
+    candidates = [primary, "utf-8", "utf-16-le", "utf-16-be"]
+    seen_texts: list[str] = []
+    result: list[list[str]] = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            text = raw.decode(candidate, errors="replace")
+        except LookupError:
+            continue
+        if text in seen_texts:
+            continue
+        seen_texts.append(text)
+        result.append([line.rstrip("\n\r") for line in text.splitlines()])
+    return result
+
+
 # ---------------------------------------------------------------------- #
 # Log grammar (formats taken from the emitting code, not guessed)
 # ---------------------------------------------------------------------- #
@@ -138,12 +167,22 @@ class FileReport:
 
 def analyze(path: Path, encoding: str | None) -> FileReport:
     report = FileReport(path=path)
-    lines = iter_lines(path, encoding)
+    passes = iter_lines_all_encodings(path, encoding)
     report.encoding = encoding or detect_encoding(path)
-    text = "\n".join(lines)
-    cloud_hits = sum(text.count(m) for m in _CLOUD_MARKERS)
-    edge_hits = sum(text.count(m) for m in _EDGE_MARKERS)
+    all_text = "\n".join("\n".join(lines) for lines in passes)
+    cloud_hits = sum(all_text.count(m) for m in _CLOUD_MARKERS)
+    edge_hits = sum(all_text.count(m) for m in _EDGE_MARKERS)
     report.role = "cloud" if cloud_hits > edge_hits else "edge" if edge_hits else "unknown"
+
+    for lines in passes:
+        _scan(lines, report)
+    return report
+
+
+def _scan(lines: list[str], report: FileReport) -> None:
+    def note_startup(entry: str) -> None:
+        if entry not in report.startup:
+            note_startup(entry)
 
     for no, line in enumerate(lines, 1):
         if _PATTERNS["port_down"].search(line):
@@ -151,32 +190,32 @@ def analyze(path: Path, encoding: str | None) -> FileReport:
                 f"L{no}: NPU 网口 down(EI0009) - hccn_tool -i <id> optical/ip/lldp 三连排查"
             )
         if _PATTERNS["gate_never"].search(line):
-            report.startup.append(f"L{no}: {line.strip()[:120]}")
+            note_startup(f"L{no}: {line.strip()[:120]}")
         m = _PATTERNS["attached"].search(line)
         if m:
-            report.startup.append(f"L{no}: done MQ attached: {m.group(1)}")
+            note_startup(f"L{no}: done MQ attached: {m.group(1)}")
         m = _PATTERNS["acquire_failed"].search(line)
         if m:
-            report.startup.append(
+            note_startup(
                 f"L{no}: done MQ acquire failed at {m.group(1)}: {m.group(2)}: {m.group(3)}"
             )
         m = _PATTERNS["hint_missing"].search(line)
         if m:
-            report.startup.append(f"L{no}: hint MQ missing (老代码路径在跑,未同步)")
+            note_startup(f"L{no}: hint MQ missing (老代码路径在跑,未同步)")
         m = _PATTERNS["comm_thread"].search(line)
         if m:
-            report.startup.append(f"L{no}: comm thread rank={m.group(1)} hint MQ={m.group(2)}")
+            note_startup(f"L{no}: comm thread rank={m.group(1)} hint MQ={m.group(2)}")
         m = _PATTERNS["hint_dropped"].search(line)
         if m:
             report.errors.append(f"L{no}: HINT DROPPED {m.group(1)}")
         m = _PATTERNS["engine_assembled"].search(line)
         if m:
-            report.startup.append(f"L{no}: control plane on {m.group(1)}")
+            note_startup(f"L{no}: control plane on {m.group(1)}")
         m = _PATTERNS["edge_assembled"].search(line)
         if m:
-            report.startup.append(f"L{no}: edge assembled, cloud at {m.group(1)}")
+            note_startup(f"L{no}: edge assembled, cloud at {m.group(1)}")
         if _PATTERNS["cloud_params"].search(line):
-            report.startup.append(f"L{no}: cloud scheduling limits verified (边云握手闭环)")
+            note_startup(f"L{no}: cloud scheduling limits verified (边云握手闭环)")
         if _PATTERNS["http_post"].search(line):
             report.http_posts += 1
         m = _PATTERNS["has_work"].search(line)
@@ -184,7 +223,7 @@ def analyze(path: Path, encoding: str | None) -> FileReport:
             report.has_pending_requests = True
         m = _PATTERNS["warmup"].search(line)
         if m:
-            report.startup.append(f"L{no}: warmup my_rank={m.group(1)} peer={m.group(2)}")
+            note_startup(f"L{no}: warmup my_rank={m.group(1)} peer={m.group(2)}")
         for key in ("submit", "done", "report"):
             m = _PATTERNS[key].search(line)
             if m:
