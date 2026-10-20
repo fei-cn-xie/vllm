@@ -29,10 +29,14 @@ def test_penalties_are_forwarded_not_neutralized() -> None:
 
 
 def test_sampler_probe_stays_installed() -> None:
+    """探针已移至 worker 进程(ascend 仓 lwd_cloud_worker);引擎文件里
+    保留 wire penalties 日志即可(2026-10-20:引擎进程装补丁对 worker 进程
+    的模块副本无效,内核实际在 worker 里发射)。"""
     src = ENGINE.read_text(encoding="utf-8")
-    assert "def lwd_install_sampler_probe() -> None:" in src
-    assert "lwd_install_sampler_probe()" in src
-    assert "bincount launch" in src and "OUT-OF-RANGE" in src
+    assert "wire penalties" in src, "wire penalty observation log is gone"
+    assert "lwd_install_sampler_probe" not in src, (
+        "sampler probe should live in the worker process, not the engine"
+    )
 
 
 def test_cloud_request_carries_block_hasher() -> None:

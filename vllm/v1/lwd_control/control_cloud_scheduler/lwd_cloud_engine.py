@@ -8,7 +8,6 @@ metadata is flushed to the edge in post_step."""
 
 from __future__ import annotations
 
-import os
 import queue
 import threading
 import time
@@ -47,73 +46,6 @@ from vllm.v1.request import Request
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
-
-
-# 2026-10-20 aivec 事故(token_bin_counts_and_mask_kernel,云侧多请求)的
-# 观测探针:激活条件与内核输入此前全部是推断、从未被观测过。探针把两处
-# 推断变成日志——惩罚路径激活时的参数值、分箱内核每次发射时的输入统计
-# (形状/步长/数据指针/预算内 min-max,越界值升 WARNING 并转储样本)。
-# 只包一层函数,不改任何上游文件;根因定位后整体删除。
-_LWD_SAMPLER_PROBE_BUDGET = int(os.getenv("VLLM_LWD_SAMPLER_PROBE_BUDGET", "200"))
-
-
-def lwd_install_sampler_probe() -> None:
-    """Install once per process; idempotent."""
-    import vllm_ascend.ops.triton.penalty as penalty_mod
-    from vllm_ascend.sample import sampler as sampler_mod
-
-    if getattr(penalty_mod, "_lwd_probe_installed", False):
-        return
-    penalty_mod._lwd_probe_installed = True
-
-    budget = {"left": _LWD_SAMPLER_PROBE_BUDGET}
-    orig_entry = penalty_mod.get_token_bin_counts_and_mask_triton
-
-    def probed_entry(tokens, vocab_size, num_seqs=None):
-        in_range_note = ""
-        if budget["left"] > 0:
-            budget["left"] -= 1
-            t_min = int(tokens.min().item())
-            t_max = int(tokens.max().item())
-            in_range_note = f" min={t_min} max={t_max}"
-            if t_min < 0 or t_max >= vocab_size:
-                lwd_logger.warning(
-                    "[LWD][sampler-probe] bincount OUT-OF-RANGE tokens "
-                    "shape=%s stride=%s ptr=0x%x vocab=%d min=%d max=%d "
-                    "sample=%s",
-                    tuple(tokens.shape), tokens.stride(), tokens.data_ptr(),
-                    vocab_size, t_min, t_max, tokens.flatten()[:64].tolist(),
-                )
-        lwd_logger.info(
-            "[LWD][sampler-probe] bincount launch shape=%s stride=%s "
-            "ptr=0x%x vocab=%d num_seqs=%s%s",
-            tuple(tokens.shape), tokens.stride(), tokens.data_ptr(),
-            vocab_size, num_seqs, in_range_note,
-        )
-        return orig_entry(tokens, vocab_size, num_seqs)
-
-    penalty_mod.get_token_bin_counts_and_mask_triton = probed_entry
-
-    orig_apply = sampler_mod.AscendSampler.apply_penalties
-
-    def probed_apply(logits, sampling_metadata, output_token_ids):
-        if not sampling_metadata.no_penalties and budget["left"] > 0:
-            prompt_ids = sampling_metadata.prompt_token_ids
-            lwd_logger.info(
-                "[LWD][sampler-probe] penalties ACTIVE logits=%s rep=%s "
-                "pres=%s freq=%s prompt_ids=%s",
-                tuple(logits.shape),
-                sampling_metadata.repetition_penalties.tolist()[:8],
-                sampling_metadata.presence_penalties.tolist()[:8],
-                sampling_metadata.frequency_penalties.tolist()[:8],
-                ("None" if prompt_ids is None else tuple(prompt_ids.shape)),
-            )
-        return orig_apply(logits, sampling_metadata, output_token_ids)
-
-    sampler_mod.AscendSampler.apply_penalties = staticmethod(probed_apply)
-    lwd_logger.info(
-        "[LWD][sampler-probe] installed (budget=%d)", _LWD_SAMPLER_PROBE_BUDGET
-    )
 
 
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
@@ -155,7 +87,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         )
 
     def _lwd_assemble(self) -> None:
-        lwd_install_sampler_probe()
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
