@@ -104,6 +104,8 @@ class Report:
     files: list[str] = field(default_factory=list)
     encodings: dict[str, str] = field(default_factory=dict)
     penalties_active: int = 0
+    penalty_input_poison: int = 0        # 修复后惩罚输入仍含 -1 的行数(真判据)
+    penalty_input_rows_seen: int = 0
     bincount_launches: LaunchStat = field(default_factory=LaunchStat)
     wire_penalties_total: int = 0
     wire_penalties_nonzero: int = 0
@@ -136,7 +138,8 @@ _RE_LAUNCH = re.compile(
     r"max=(?P<max>-?\d+))?"
 )
 _RE_OUT_OF_RANGE = re.compile(r"bincount OUT-OF-RANGE.*?min=(?P<min>-?\d+) max=(?P<max>-?\d+)")
-_RE_ACTIVE = re.compile(r"penalties ACTIVE")
+_RE_ACTIVE = re.compile(r"penalties ACTIVE(.*?poison_rows=(?P<poison>-?\d+))?")
+_RE_PENALTY_POISON = re.compile(r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)")
 _RE_WIRE = re.compile(
     r"wire penalties req=(?P<req>\S+) rep=(?P<rep>-?[\d.]+) "
     r"pres=(?P<pres>-?[\d.]+) freq=(?P<freq>-?[\d.]+)"
@@ -168,8 +171,15 @@ _FAULT_PATTERNS = ("EZ9999", "aivec", "illegal gm", "ai core", "innererror", "de
 
 def analyze_line(line: str, rep: Report) -> None:
     """只解析探针行;疑似故障行由 analyze() 持真实行号负责。"""
-    if _RE_ACTIVE.search(line):
+    if (m := _RE_ACTIVE.search(line)):
         rep.penalties_active += 1
+        if m.group("poison") is not None:
+            rep.penalty_input_rows_seen += 1
+            if int(m.group("poison")) > 0:
+                rep.penalty_input_poison += int(m.group("poison"))
+    if (m := _RE_PENALTY_POISON.search(line)):
+        rep.penalty_input_poison += int(m.group("hit"))
+        rep.penalty_input_rows_seen += 1
     if (m := _RE_LAUNCH.search(line)):
         s = rep.bincount_launches
         s.count += 1
@@ -257,19 +267,28 @@ def verdict(rep: Report) -> tuple[str, list[str]]:
         return INVALID, notes
     if rep.penalties_active == 0:
         notes.append("有 bincount launch 但无 penalties ACTIVE 行(budget 耗尽或旧版云):launch 数即证据")
-    poison = rep.poison_prompt_route + rep.poison_output_route
-    if poison:
-        for e in rep.poison_events[:5]:
+    # 毒判据(2026-10-20 修正):惩罚输入(修复后)含 -1,或 spec 写入 prompt 区。
+    # token_ids_cpu 账本含 -1 是 async 调度设计常态(上游 :3815 亲手写 -1),
+    # 仅作信息项,不构成毒证据。
+    kernel_poison = rep.penalty_input_poison + len(rep.write_into_prompt)
+    if kernel_poison:
+        if rep.penalty_input_poison:
             notes.append(
-                f"POISON RESIDENT req={e['req']} prompt_-1={e['prompt_-1']} "
-                f"output_-1={e['output_-1']} start={e['start']}/{e['prompt_len']}"
+                f"PENALTY INPUT POISON:修复后惩罚输入含 -1 共 "
+                f"{rep.penalty_input_poison} 行(观测 {rep.penalty_input_rows_seen} 次)"
+                f"——占位修复链(update_async_output_token_ids)在云侧失效"
             )
         for e in rep.write_into_prompt[:5]:
             notes.append(f"WRITE INTO PROMPT REGION req={e['req']} start={e['start']} num_prompt={e['num_prompt']}")
-        if len(rep.poison_events) > 5 or len(rep.write_into_prompt) > 5:
-            notes.append(f"...共 poison {len(rep.poison_events)} 条 / 越界写 {len(rep.write_into_prompt)} 条")
+        if len(rep.write_into_prompt) > 5:
+            notes.append(f"...共越界写 {len(rep.write_into_prompt)} 条")
         return (CRASHED if rep.fault_observed else SILENT), notes
-    notes.append("驻留扫描与写入探针全阴:token_ids_cpu 无 -1 哨兵残留")
+    notes.append("修复后惩罚输入无 -1(占位修复链工作正常)")
+    if rep.poison_events:
+        notes.append(
+            f"注:token_ids_cpu 账本含 -1 共 {len(rep.poison_events)} 条——"
+            "async 设计常态,不进内核"
+        )
     if rep.bincount_launches.neg_min_seen or rep.bincount_launches.out_of_range:
         notes.append(
             f"但历史 launch 观测到负值(min={rep.bincount_launches.observed_min},"
@@ -289,7 +308,10 @@ def render(rep: Report) -> str:
         f"探针安装行          : {rep.probe_installed}",
         f"对齐 profile 采纳    : {rep.align_profile_adopted or '(未见——边侧未到启动校验?)'}",
         f"wire penalties       : 总 {rep.wire_penalties_total} / 非默认 {rep.wire_penalties_nonzero}",
-        f"penalties ACTIVE     : {rep.penalties_active}",
+        f"penalties ACTIVE     : {rep.penalties_active}"
+        + (f" (含 poison_rows 标注 {rep.penalty_input_rows_seen} 次)" if rep.penalty_input_rows_seen else ""),
+        f"惩罚输入毒(真判据)   : {rep.penalty_input_poison} 行 / 观测 {rep.penalty_input_rows_seen} 次"
+        f"  [PENALTY INPUT POISON 命中即修复链失效]",
         f"bincount launch      : {s.count} 次, num_seqs<= {s.max_num_seqs}, "
         f"去重 ptr {len(s.distinct_ptrs)} 个",
         f"  (三重彩票参考: 仅批内第 0 行且 ptr 段边界才 fault; num_seqs 越大 lottery 越难中)",
@@ -329,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "files": rep.files, "encodings": rep.encodings, "verdict": v,
             "penalties_active": rep.penalties_active,
+            "penalty_input_poison": rep.penalty_input_poison,
+            "penalty_input_rows_seen": rep.penalty_input_rows_seen,
             "bincount_launches": {
                 "count": rep.bincount_launches.count,
                 "max_num_seqs": rep.bincount_launches.max_num_seqs,

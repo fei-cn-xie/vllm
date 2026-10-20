@@ -153,16 +153,30 @@ VERDICT_CASES = [
         {"launch": 1, "neg_min_seen": 1, "out_of_range": 1, "observed_min": -1},
     ),
     VerdictCase(
+        "账本毒-async设计常态-不算毒", [ACTIVE, LAUNCH, POISON_PROMPT],
+        "毒源枯竭",
+        {"poison": 1, "penalty_input_poison": 0},
+    ),
+    VerdictCase(
+        "惩罚输入毒-修复链失效-静默污染", [
+            ACTIVE + " poison_rows=2",
+            LAUNCH,
+            "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=2/16",
+        ], "毒源仍在-静默污染",
+        {"penalty_input_poison": 4, "penalty_input_rows_seen": 2},
+    ),
+    VerdictCase(
         "毒在-无故障行-静默污染", [ACTIVE, LAUNCH, POISON_PROMPT, WRITE_PROMPT],
         "毒源仍在-静默污染",
         {"poison_prompt_route": 2, "fault": False},
     ),
     VerdictCase(
         "毒在-有故障行-已崩溃", [
-            ACTIVE, LAUNCH, POISON_PROMPT,
+            ACTIVE, LAUNCH,
+            "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=1/16",
             "EE1001 : 2026-10-20 10:33:00 device fault aivec kernel Illegal memory access",
         ], "毒源仍在-已崩溃",
-        {"fault": True},
+        {"fault": True, "penalty_input_poison": 1},
     ),
     VerdictCase(
         "注入窗口失配字段解析", [ACTIVE, LAUNCH, INJECT], "毒源枯竭",
@@ -188,6 +202,8 @@ def _check_verdict(case: VerdictCase) -> None:
         assert rep.bincount_launches.out_of_range == c.get("out_of_range", rep.bincount_launches.out_of_range)
         assert rep.bincount_launches.observed_min == c.get("observed_min", rep.bincount_launches.observed_min)
         assert rep.fault_observed == c.get("fault", rep.fault_observed)
+        assert rep.penalty_input_poison == c.get("penalty_input_poison", rep.penalty_input_poison)
+        assert rep.penalty_input_rows_seen == c.get("penalty_input_rows_seen", rep.penalty_input_rows_seen)
         if "inject_rows" in c:
             assert rep.inject_mismatch[0]["chunk_rows"] == c["inject_rows"]
             assert rep.inject_mismatch[0]["scheduled"] == c["inject_sched"]
@@ -201,14 +217,17 @@ def test_verdict_matrix(case: VerdictCase) -> None:
 
 
 def test_json_output() -> None:
-    path = write_log([ACTIVE, LAUNCH, POISON_PROMPT], "utf-8")
+    path = write_log([
+        ACTIVE, LAUNCH,
+        "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=1/16",
+    ], "utf-8")
     out = Path(tempfile.gettempdir()) / "lwd_analyzer_test_out.json"
     try:
         rc = analyzer.main([str(path), "--json", str(out)])
         assert rc == 0
         payload = json.loads(out.read_text(encoding="utf-8"))
         assert payload["verdict"] == "毒源仍在-静默污染"
-        assert payload["poison_events"][0]["req"] == "abc-1"
+        assert payload["penalty_input_poison"] == 1
     finally:
         path.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
