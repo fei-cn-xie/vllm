@@ -28,6 +28,9 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_chunk_align import (
+    lwd_build_chunk_align_profile,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
@@ -91,11 +94,17 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits the edge checks (same inputs of the cap/preflight
-        # formulas on both sides).
+        # formulas on both sides); the chunk align profile carries the
+        # cloud-only chunk-cutting branches (mamba block alignment, MTP
+        # prefill lookahead) the edge adopts so its native schedule() cuts
+        # chunks exactly like this side will.
         self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
+            chunk_align=lwd_build_chunk_align_profile(
+                self.scheduler, self.vllm_config.cache_config
+            ),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request

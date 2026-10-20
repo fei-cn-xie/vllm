@@ -32,6 +32,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_chunk_align import (
+    lwd_apply_chunk_align_profile,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -184,6 +187,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{self.scheduler.max_num_running_reqs} x {spec_factor}); "
                     f"increase max_num_batched_tokens or decrease max_num_seqs"
                 )
+        # Chunk-cutting profile: the cloud's native schedule() re-cuts chunks
+        # through branches the edge cannot derive locally (mamba block
+        # alignment, MTP prefill lookahead); without adopting them the edge
+        # sends chunk rows the cloud will not schedule verbatim (the INJECT
+        # window mismatch). Old clouds predate the field: fail fast instead
+        # of scheduling chunks the cloud would silently re-cut.
+        if params.chunk_align is None:
+            raise RuntimeError(
+                "[LWD] cloud sent no chunk alignment profile (cloud older "
+                "than the edge?); deploy matching versions on both sides"
+            )
+        lwd_apply_chunk_align_profile(
+            self.scheduler,
+            self.vllm_config.cache_config,
+            params.chunk_align,
+        )
         lwd_logger.info("[cloud-params] scheduling limits verified: %s", local)
 
     def _lwd_send_to_cloud(self, message: LwdEdgeToCloudMessage) -> None:
