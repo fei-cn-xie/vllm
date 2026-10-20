@@ -36,8 +36,8 @@ def lwd_cloud_block_hasher(
     """Build the per-request hasher closure; None disables hashing."""
     if not vllm_config.cache_config.enable_prefix_caching:
         return None
+    from vllm.utils.hashing import get_hash_fn_by_name
     from vllm.v1.core.kv_cache_utils import (
-        get_hash_fn_by_name,
         get_request_block_hasher,
         init_none_hash,
         resolve_kv_cache_block_sizes,

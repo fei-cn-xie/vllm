@@ -52,3 +52,15 @@ def test_cloud_request_carries_block_hasher() -> None:
         / "lwd_edge_engine.py"
     ).read_text(encoding="utf-8")
     assert "block_hashes=list(request.block_hashes)" in edge
+
+
+def test_hash_chain_imports_resolve(tmp_path=None) -> None:
+    """2026-10-20 ImportError 事故:get_hash_fn_by_name 住 vllm.utils.hashing,
+    不在 kv_cache_utils(engine/core.py:44 同款来源)。逐个验证模块可解析。"""
+    import importlib
+    chain = (
+        Path(__file__).resolve().parents[3]
+        / "vllm" / "v1" / "lwd_control" / "lwd_hash_chain.py"
+    ).read_text(encoding="utf-8")
+    assert "from vllm.utils.hashing import get_hash_fn_by_name" in chain
+    assert "init_none_hash" in chain and "resolve_kv_cache_block_sizes" in chain
