@@ -247,7 +247,7 @@ def test_verdict_matrix(case: VerdictCase) -> None:
 
 def test_json_output() -> None:
     path = write_log([
-        ACTIVE, LAUNCH,
+        ACTIVE + " poison_rows=1", LAUNCH,
         "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=1/16",
     ], "utf-8")
     out = Path(tempfile.gettempdir()) / "lwd_analyzer_test_out.json"
