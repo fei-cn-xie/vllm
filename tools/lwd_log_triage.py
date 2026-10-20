@@ -161,6 +161,7 @@ _PATTERNS = {
     "has_work": re.compile(r"\[has_work\] engines_running=(\w+) has_requests=(\w+)"),
     "warmup": re.compile(r"data-plane warmup done: channel=\S+ my_rank=(\d+) peer=(\d+)"),
     "port_down": re.compile(r"Communication_Error_Initialize_Transport|network port is down"),
+    "wrong_endpoint": re.compile(r"RuntimeError: \[LWD\] rank (\d+) holds no lwd_\w+ channel"),
     "gate_never": re.compile(r"pre-recv gate will never open"),
 }
 
@@ -231,6 +232,12 @@ def _scan(lines: list[str], report: FileReport) -> None:
             report.startup.append(entry)
 
     for no, line in enumerate(lines, 1):
+        m = _PATTERNS["wrong_endpoint"].search(line)
+        if m:
+            report.errors.append(
+                f"L{no}: rank {m.group(1)} 被误选为通道端点(rank 域错配,"
+                "通信线程已死)"
+            )
         if _PATTERNS["port_down"].search(line):
             report.errors.append(
                 f"L{no}: NPU 网口 down(EI0009) - hccn_tool -i <id> optical/ip/lldp 三连排查"
