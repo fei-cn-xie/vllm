@@ -194,7 +194,8 @@ VERDICT_CASES = [
     ),
     VerdictCase(
         "毒在-有故障行-已崩溃", [
-            ACTIVE, LAUNCH,
+            ACTIVE + " poison_rows=1",
+            LAUNCH,
             "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=1/16",
             "EE1001 : 2026-10-20 10:33:00 device fault aivec kernel Illegal memory access",
         ], "毒源仍在-已崩溃",

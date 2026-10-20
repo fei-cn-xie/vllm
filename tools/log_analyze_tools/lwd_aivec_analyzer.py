@@ -189,11 +189,10 @@ def analyze_line(line: str, rep: Report) -> None:
     if (m := _RE_ACTIVE.search(line)):
         rep.penalties_active += 1
         if m.group("poison") is not None:
-            # 覆盖计数只记一次;毒行数以 PENALTY INPUT POISON 行为准
-            # (同一事件两行都打,此处累计会双份)
+            # 单一来源累计:每个事件必有一条 ACTIVE 行(带 poison_rows/
+            # spec_poison 字段);告警行是同一事件的副本,不重复计
             rep.penalty_input_rows_seen += 1
-    if (m := _RE_PENALTY_POISON.search(line)):
-        rep.penalty_input_poison += int(m.group("hit"))
+            rep.penalty_input_poison += int(m.group("poison"))
     if (m := _RE_SPEC_POISON.search(line)):
         rep.penalty_spec_poison += int(m.group(1))
     if (m := _RE_REPAIR_STAT.search(line)):
@@ -395,18 +394,72 @@ def render(rep: Report) -> str:
     return "\n".join(out)
 
 
+def render_compare(base: Report, lwd: Report) -> str:
+    """归属终审对比:移植版基线 vs LWD,同仪器同指标并排,结论三选一。"""
+    vb, _ = verdict(base)
+    vl, _ = verdict(lwd)
+
+    def fault_n(r: Report) -> int:
+        return len(r.suspected_fault_lines)
+
+    rows = [
+        ("判定", vb, vl),
+        ("penalties ACTIVE", base.penalties_active, lwd.penalties_active),
+        ("惩罚输入毒行", base.penalty_input_poison, lwd.penalty_input_poison),
+        ("  其中 spec 段", base.penalty_spec_poison, lwd.penalty_spec_poison),
+        ("修复调用/修复行",
+         f"{base.repair_stat_calls}/{base.repair_repaired}",
+         f"{lwd.repair_stat_calls}/{lwd.repair_repaired}"),
+        ("bincount launch", base.bincount_launches.count, lwd.bincount_launches.count),
+        ("疑似故障行", fault_n(base), fault_n(lwd)),
+    ]
+    if base.penalty_input_poison > 0 and lwd.penalty_input_poison > 0:
+        conclusion = ("两侧同毒 → 归属移植版内核,LWD 零引入(终审完成;"
+                      "修内核一行)")
+    elif base.penalty_input_poison == 0 and lwd.penalty_input_poison > 0:
+        conclusion = ("基线全阴而 LWD 有毒 → LWD 数据流存在分叉,"
+                      "回挖 LWD 差异(基线有效性先由 penalties ACTIVE 行确认)")
+    else:
+        conclusion = ("两侧全阴 → 本轮流量未触发毒,按复现配方"
+                      "(先无惩罚单请求再带惩罚 bench)加压重测")
+    out = [
+        "=" * 72,
+        "移植版基线 vs LWD 对比(同仪器:VLLM_LWD_SAMPLER_PROBE=1)",
+        f"  baseline files={base.files}",
+        f"  lwd      files={lwd.files}",
+        "-" * 72,
+        f"{'指标':<18}{'移植版基线':>26}{'LWD':>26}",
+    ]
+    for name, a, b in rows:
+        out.append(f"{name:<18}{str(a):>26}{str(b):>26}")
+    out += ["-" * 72, f"结论: {conclusion}", "=" * 72]
+    return "\n".join(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LWD aivec 探针日志分析器")
-    parser.add_argument("logs", nargs="+", type=Path, help="日志文件(可多个,任意编码)")
+    parser.add_argument("logs", nargs="*", type=Path, help="日志文件(可多个,任意编码)")
+    parser.add_argument("--compare", nargs=2, type=Path, metavar=("BASELINE", "LWD"),
+                        help="归属终审:移植版基线日志 vs LWD 日志并排对比")
     parser.add_argument("--json", type=Path, default=None, help="附加输出 JSON 到此路径")
     parser.add_argument("--encoding", default=None,
                         help="强制指定输入编码(默认 BOM/NUL 启发式自适应)")
     args = parser.parse_args(argv)
-    for path in args.logs:
+    if args.compare:
+        paths = args.compare
+    else:
+        paths = args.logs
+    if not paths:
+        parser.error("需要日志文件,或使用 --compare BASELINE LWD")
+    for path in paths:
         if not path.is_file():
             print(f"[analyzer] 文件不存在: {path}", file=sys.stderr)
             return 2
-    rep = analyze(args.logs, args.encoding)
+    if args.compare:
+        print(render_compare(analyze([args.compare[0]], args.encoding),
+                             analyze([args.compare[1]], args.encoding)))
+        return 0
+    rep = analyze(paths, args.encoding)
     print(render(rep))
     if args.json:
         v, _ = verdict(rep)
