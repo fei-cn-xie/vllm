@@ -158,6 +158,19 @@ VERDICT_CASES = [
         {"poison": 1, "penalty_input_poison": 0},
     ),
     VerdictCase(
+        "惩罚输入毒-prev_miss主导-断点读数", [
+            ACTIVE + " poison_rows=2",
+            LAUNCH,
+            "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=2/16",
+            "[lwd][LWD][spec-probe] REPAIR STAT repaired=0 prev_miss=14 "
+            "tail_not_ph=0 tail_clean=2 empty_new=0 prev_map=0 rows=16",
+            "[lwd][LWD][spec-probe] REPAIR STAT repaired=0 prev_miss=14 "
+            "tail_not_ph=0 tail_clean=2 empty_new=0 prev_map=0 rows=16",
+        ], "毒源仍在-静默污染",
+        {"penalty_input_poison": 2, "penalty_input_rows_seen": 1,
+         "repair_stat_calls": 2, "repair_prev_miss": 28, "repair_repaired": 0},
+    ),
+    VerdictCase(
         "惩罚输入毒-修复链失效-静默污染", [
             ACTIVE + " poison_rows=2",
             LAUNCH,
@@ -205,6 +218,11 @@ def _check_verdict(case: VerdictCase) -> None:
         assert rep.fault_observed == c.get("fault", rep.fault_observed)
         assert rep.penalty_input_poison == c.get("penalty_input_poison", rep.penalty_input_poison)
         assert rep.penalty_input_rows_seen == c.get("penalty_input_rows_seen", rep.penalty_input_rows_seen)
+        assert rep.repair_stat_calls == c.get("repair_stat_calls", rep.repair_stat_calls)
+        assert rep.repair_repaired == c.get("repair_repaired", rep.repair_repaired)
+        assert rep.repair_prev_miss == c.get("repair_prev_miss", rep.repair_prev_miss)
+        assert rep.repair_tail_not_ph == c.get("repair_tail_not_ph", rep.repair_tail_not_ph)
+        assert rep.repair_empty_new == c.get("repair_empty_new", rep.repair_empty_new)
         if "inject_rows" in c:
             assert rep.inject_mismatch[0]["chunk_rows"] == c["inject_rows"]
             assert rep.inject_mismatch[0]["scheduled"] == c["inject_sched"]

@@ -106,6 +106,13 @@ class Report:
     penalties_active: int = 0
     penalty_input_poison: int = 0        # 修复后惩罚输入仍含 -1 的行数(真判据)
     penalty_input_rows_seen: int = 0
+    repair_stat_calls: int = 0           # REPAIR STAT 行数(修复函数被调且有对象)
+    repair_repaired: int = 0
+    repair_prev_miss: int = 0
+    repair_tail_not_ph: int = 0
+    repair_tail_clean: int = 0
+    repair_empty_new: int = 0
+    repair_bail_set_missing: int = 0     # REPAIR BAIL 行数(set 侧未存引用)
     bincount_launches: LaunchStat = field(default_factory=LaunchStat)
     wire_penalties_total: int = 0
     wire_penalties_nonzero: int = 0
@@ -140,6 +147,12 @@ _RE_LAUNCH = re.compile(
 _RE_OUT_OF_RANGE = re.compile(r"bincount OUT-OF-RANGE.*?min=(?P<min>-?\d+) max=(?P<max>-?\d+)")
 _RE_ACTIVE = re.compile(r"penalties ACTIVE(.*?poison_rows=(?P<poison>-?\d+))?")
 _RE_PENALTY_POISON = re.compile(r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)")
+_RE_REPAIR_STAT = re.compile(
+    r"REPAIR STAT repaired=(?P<rep>\d+) prev_miss=(?P<pm>\d+) "
+    r"tail_not_ph=(?P<tn>\d+) tail_clean=(?P<tc>\d+) empty_new=(?P<en>\d+) "
+    r"prev_map=(?P<pmap>\d+) rows=(?P<rows>\d+)"
+)
+_RE_REPAIR_BAIL = re.compile(r"REPAIR BAIL set_missing=(?P<sm>\d+)")
 _RE_WIRE = re.compile(
     r"wire penalties req=(?P<req>\S+) rep=(?P<rep>-?[\d.]+) "
     r"pres=(?P<pres>-?[\d.]+) freq=(?P<freq>-?[\d.]+)"
@@ -179,6 +192,15 @@ def analyze_line(line: str, rep: Report) -> None:
             rep.penalty_input_rows_seen += 1
     if (m := _RE_PENALTY_POISON.search(line)):
         rep.penalty_input_poison += int(m.group("hit"))
+    if (m := _RE_REPAIR_STAT.search(line)):
+        rep.repair_stat_calls += 1
+        rep.repair_repaired += int(m.group("rep"))
+        rep.repair_prev_miss += int(m.group("pm"))
+        rep.repair_tail_not_ph += int(m.group("tn"))
+        rep.repair_tail_clean += int(m.group("tc"))
+        rep.repair_empty_new += int(m.group("en"))
+    if _RE_REPAIR_BAIL.search(line):
+        rep.repair_bail_set_missing += 1
     if (m := _RE_LAUNCH.search(line)):
         s = rep.bincount_launches
         s.count += 1
@@ -277,6 +299,24 @@ def verdict(rep: Report) -> tuple[str, list[str]]:
                 f"{rep.penalty_input_poison} 行(观测 {rep.penalty_input_rows_seen} 次)"
                 f"——占位修复链(update_async_output_token_ids)在云侧失效"
             )
+        if rep.repair_stat_calls or rep.repair_bail_set_missing:
+            branches = {
+                "set 侧未存引用(set_async_sampled_token_ids 链断)": rep.repair_bail_set_missing,
+                "prev 映射失配(提案路径簿记断)": rep.repair_prev_miss,
+                "尾部非占位(占位判定不成立)": rep.repair_tail_not_ph,
+                "真值列表空(D2H 未落)": rep.repair_empty_new,
+            }
+            top = max(branches, key=lambda k: branches[k])
+            notes.append(
+                f"修复链断点读数: {top} — bail {branches[top]} 次 "
+                f"(共调用 {rep.repair_stat_calls} 次, 成功修复 "
+                f"{rep.repair_repaired} 行)"
+            )
+        else:
+            notes.append(
+                "未见 REPAIR STAT/BAIL 行:云侧版本早于 fa24e13e6(未带断点"
+                "探针),更新后重跑可定位分支"
+            )
         for e in rep.write_into_prompt[:5]:
             notes.append(f"WRITE INTO PROMPT REGION req={e['req']} start={e['start']} num_prompt={e['num_prompt']}")
         if len(rep.write_into_prompt) > 5:
@@ -311,6 +351,10 @@ def render(rep: Report) -> str:
         + (f" (含 poison_rows 标注 {rep.penalty_input_rows_seen} 次)" if rep.penalty_input_rows_seen else ""),
         f"惩罚输入毒(真判据)   : {rep.penalty_input_poison} 行 / 观测 {rep.penalty_input_rows_seen} 次"
         f"  [PENALTY INPUT POISON 命中即修复链失效]",
+        f"修复链分支           : 调用 {rep.repair_stat_calls} 次 repaired={rep.repair_repaired} "
+        f"prev_miss={rep.repair_prev_miss} tail_not_ph={rep.repair_tail_not_ph} "
+        f"tail_clean={rep.repair_tail_clean} empty_new={rep.repair_empty_new} "
+        f"set_missing={rep.repair_bail_set_missing}",
         f"bincount launch      : {s.count} 次, num_seqs<= {s.max_num_seqs}, "
         f"去重 ptr {len(s.distinct_ptrs)} 个",
         f"  (三重彩票参考: 仅批内第 0 行且 ptr 段边界才 fault; num_seqs 越大 lottery 越难中)",
@@ -352,6 +396,13 @@ def main(argv: list[str] | None = None) -> int:
             "penalties_active": rep.penalties_active,
             "penalty_input_poison": rep.penalty_input_poison,
             "penalty_input_rows_seen": rep.penalty_input_rows_seen,
+            "repair_stat_calls": rep.repair_stat_calls,
+            "repair_repaired": rep.repair_repaired,
+            "repair_prev_miss": rep.repair_prev_miss,
+            "repair_tail_not_ph": rep.repair_tail_not_ph,
+            "repair_tail_clean": rep.repair_tail_clean,
+            "repair_empty_new": rep.repair_empty_new,
+            "repair_bail_set_missing": rep.repair_bail_set_missing,
             "bincount_launches": {
                 "count": rep.bincount_launches.count,
                 "max_num_seqs": rep.bincount_launches.max_num_seqs,
