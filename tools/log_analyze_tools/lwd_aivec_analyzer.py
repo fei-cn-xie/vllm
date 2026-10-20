@@ -174,12 +174,11 @@ def analyze_line(line: str, rep: Report) -> None:
     if (m := _RE_ACTIVE.search(line)):
         rep.penalties_active += 1
         if m.group("poison") is not None:
+            # 覆盖计数只记一次;毒行数以 PENALTY INPUT POISON 行为准
+            # (同一事件两行都打,此处累计会双份)
             rep.penalty_input_rows_seen += 1
-            if int(m.group("poison")) > 0:
-                rep.penalty_input_poison += int(m.group("poison"))
     if (m := _RE_PENALTY_POISON.search(line)):
         rep.penalty_input_poison += int(m.group("hit"))
-        rep.penalty_input_rows_seen += 1
     if (m := _RE_LAUNCH.search(line)):
         s = rep.bincount_launches
         s.count += 1

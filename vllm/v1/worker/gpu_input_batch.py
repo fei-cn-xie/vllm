@@ -35,6 +35,11 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 _LWD_RESIDENCY_SCAN_BUDGET = 2000
 _lwd_residency_left = [_LWD_RESIDENCY_SCAN_BUDGET]
 
+# 排查续③:修复链 bail 分支计数预算(update_async_output_token_ids
+# 每次调用消耗 1;实测惩罚输入仍含 -1,本计数直接报出静默 bail 的分支)
+_LWD_REPAIR_LOG_BUDGET = 2000
+_lwd_repair_log_left = [_LWD_REPAIR_LOG_BUDGET]
+
 
 @dataclass
 class CachedRequestState:
@@ -1085,8 +1090,27 @@ class InputBatch:
         This is called right before they are needed by the logits processors.
         """
         output_token_ids = self.sampling_metadata.output_token_ids
+        # 2026-10-20 aivec 根因排查续③:实测惩罚输入仍含 -1(PENALTY
+        # INPUT POISON),本函数在某分支静默 bail。逐分支计数(纯 CPU,
+        # 零设备同步,预算门控),定论后随上文探针一起删除。
+        _probe = _lwd_repair_log_left[0] > 0
+        if _probe:
+            _lwd_repair_log_left[0] -= 1
+            _st = {"set_missing": 0, "prev_miss": 0, "tail_ok": 0,
+                   "tail_not_ph": 0, "empty_new": 0, "repaired": 0}
+        else:
+            _st = None
         if self.sampled_token_ids_cpu is None or not output_token_ids:
             # Output token ids not needed or not async scheduling.
+            if _st is not None:
+                _st["set_missing"] = 1
+                from vllm.lwd_logger import lwd_logger
+                lwd_logger.info(
+                    "[LWD][spec-probe] REPAIR BAIL set_missing=%d "
+                    "(cpu_ref=%s rows=%d)", _st["set_missing"],
+                    self.sampled_token_ids_cpu is not None,
+                    len(output_token_ids),
+                )
             return
 
         assert self.prev_req_id_to_index is not None
@@ -1094,11 +1118,15 @@ class InputBatch:
         for index, req_id in enumerate(self.req_ids):
             prev_index = self.prev_req_id_to_index.get(req_id)
             if prev_index is None:
+                if _st is not None:
+                    _st["prev_miss"] += 1
                 continue
             req_output_token_ids = output_token_ids[index]
             if not req_output_token_ids or req_output_token_ids[-1] != -1:
                 # Final output id is not a placeholder, some tokens must have
                 # been discarded after a kv-load failure.
+                if _st is not None:
+                    _st["tail_not_ph" if req_output_token_ids else "tail_ok"] += 1
                 continue
             if sampled_token_ids is None:
                 assert self.async_copy_ready_event is not None
@@ -1107,6 +1135,8 @@ class InputBatch:
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]
             if not new_ids:
+                if _st is not None:
+                    _st["empty_new"] += 1
                 continue
             num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
             # Also account for case where there may be a smaller number of
@@ -1124,6 +1154,19 @@ class InputBatch:
             del new_ids[num_to_replace:]
             req_output_token_ids[first_placeholder:] = new_ids
             # ^ Implicitly resizes to (first_placeholder + num_to_replace)
+            if _st is not None:
+                _st["repaired"] += 1
+        if _st is not None and (_st["prev_miss"] or _st["tail_not_ph"]
+                                or _st["empty_new"] or _st["repaired"]):
+            from vllm.lwd_logger import lwd_logger
+            lwd_logger.info(
+                "[LWD][spec-probe] REPAIR STAT repaired=%d prev_miss=%d "
+                "tail_not_ph=%d tail_clean=%d empty_new=%d prev_map=%d "
+                "rows=%d",
+                _st["repaired"], _st["prev_miss"], _st["tail_not_ph"],
+                _st["tail_ok"], _st["empty_new"],
+                len(self.prev_req_id_to_index or {}), len(output_token_ids),
+            )
 
     def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
         """

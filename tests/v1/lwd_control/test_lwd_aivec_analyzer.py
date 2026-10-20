@@ -163,7 +163,8 @@ VERDICT_CASES = [
             LAUNCH,
             "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=2/16",
         ], "毒源仍在-静默污染",
-        {"penalty_input_poison": 4, "penalty_input_rows_seen": 2},
+        # 双行只计一份:毒行数以 POISON 行为准
+        {"penalty_input_poison": 2, "penalty_input_rows_seen": 1},
     ),
     VerdictCase(
         "毒在-无故障行-静默污染", [ACTIVE, LAUNCH, POISON_PROMPT, WRITE_PROMPT],
