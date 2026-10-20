@@ -107,6 +107,7 @@ class Report:
     penalty_input_poison: int = 0        # 修复后惩罚输入仍含 -1 的行数(真判据)
     penalty_input_rows_seen: int = 0
     penalty_spec_poison: int = 0         # 其中 spec 段(out+spec 拼接的 spec 部分)行数
+    poison_row0_steps: int = 0           # 毒行含批内第 0 行的步数(崩溃前置①)
     repair_stat_calls: int = 0           # REPAIR STAT 行数(修复函数被调且有对象)
     repair_repaired: int = 0
     repair_prev_miss: int = 0
@@ -147,7 +148,10 @@ _RE_LAUNCH = re.compile(
 )
 _RE_OUT_OF_RANGE = re.compile(r"bincount OUT-OF-RANGE.*?min=(?P<min>-?\d+) max=(?P<max>-?\d+)")
 _RE_ACTIVE = re.compile(r"penalties ACTIVE(.*?poison_rows=(?P<poison>-?\d+))?")
-_RE_PENALTY_POISON = re.compile(r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)(?: spec_rows=(?P<spec>\d+))?")
+_RE_PENALTY_POISON = re.compile(
+    r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)"
+    r"(?: spec_rows=(?P<spec>\d+))?(?: min_idx=(?P<minidx>-?\d+))?"
+)
 _RE_SPEC_POISON = re.compile(r"spec_poison=(\d+)")
 _RE_REPAIR_STAT = re.compile(
     r"REPAIR STAT repaired=(?P<rep>\d+) prev_miss=(?P<pm>\d+) "
@@ -193,6 +197,9 @@ def analyze_line(line: str, rep: Report) -> None:
             # spec_poison 字段);告警行是同一事件的副本,不重复计
             rep.penalty_input_rows_seen += 1
             rep.penalty_input_poison += int(m.group("poison"))
+    if (m := _RE_PENALTY_POISON.search(line)):
+        if m.group("minidx") is not None and int(m.group("minidx")) == 0:
+            rep.poison_row0_steps += 1
     if (m := _RE_SPEC_POISON.search(line)):
         rep.penalty_spec_poison += int(m.group(1))
     if (m := _RE_REPAIR_STAT.search(line)):
@@ -368,7 +375,7 @@ def render(rep: Report) -> str:
         f"penalties ACTIVE     : {rep.penalties_active}"
         + (f" (含 poison_rows 标注 {rep.penalty_input_rows_seen} 次)" if rep.penalty_input_rows_seen else ""),
         f"惩罚输入毒(真判据)   : {rep.penalty_input_poison} 行 / 观测 {rep.penalty_input_rows_seen} 次"
-        f" / 其中 spec 段 {rep.penalty_spec_poison} 行",
+        f" / 其中 spec 段 {rep.penalty_spec_poison} 行 / 第0行带毒步数 {rep.poison_row0_steps}",
         f"修复链分支           : 调用 {rep.repair_stat_calls} 次 repaired={rep.repair_repaired} "
         f"prev_miss={rep.repair_prev_miss} tail_not_ph={rep.repair_tail_not_ph} "
         f"tail_clean={rep.repair_tail_clean} empty_new={rep.repair_empty_new} "
@@ -407,6 +414,8 @@ def render_compare(base: Report, lwd: Report) -> str:
         ("penalties ACTIVE", base.penalties_active, lwd.penalties_active),
         ("惩罚输入毒行", base.penalty_input_poison, lwd.penalty_input_poison),
         ("  其中 spec 段", base.penalty_spec_poison, lwd.penalty_spec_poison),
+        ("  第0行带毒步数(崩溃前置①)",
+         base.poison_row0_steps, lwd.poison_row0_steps),
         ("修复调用/修复行",
          f"{base.repair_stat_calls}/{base.repair_repaired}",
          f"{lwd.repair_stat_calls}/{lwd.repair_repaired}"),
@@ -469,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             "penalty_input_poison": rep.penalty_input_poison,
             "penalty_input_rows_seen": rep.penalty_input_rows_seen,
             "penalty_spec_poison": rep.penalty_spec_poison,
+            "poison_row0_steps": rep.poison_row0_steps,
             "repair_stat_calls": rep.repair_stat_calls,
             "repair_repaired": rep.repair_repaired,
             "repair_prev_miss": rep.repair_prev_miss,
