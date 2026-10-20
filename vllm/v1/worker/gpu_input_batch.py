@@ -519,6 +519,19 @@ class InputBatch:
         # _prepare_input_ids.
         start_index = self.num_tokens_no_spec[req_index]
         end_token_index = start_index + num_spec_tokens
+        # 2026-10-20 aivec 排障:探针实测 prompt 区域(0..num_prompt)内出现
+        # -1,疑为 spec token 写入位置落在了 prompt 区域内。打出写入位置与
+        # 值,确认是否越界到 prompt。根因定位后删除。
+        num_prompt = int(self.num_prompt_tokens[req_index])
+        if start_index < num_prompt:
+            from vllm.lwd_logger import lwd_logger
+            lwd_logger.warning(
+                "[LWD][spec-probe] WRITE INTO PROMPT REGION "
+                "req=%s start=%d num_spec=%d num_prompt=%d "
+                "spec_ids=%s",
+                req_id, start_index, num_spec_tokens, num_prompt,
+                list(spec_token_ids[:8]),
+            )
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
         self.is_token_ids[req_index, start_index:end_token_index] = True
         cur_spec_token_ids.extend(spec_token_ids)
