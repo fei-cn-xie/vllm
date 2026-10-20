@@ -106,6 +106,7 @@ class Report:
     penalties_active: int = 0
     penalty_input_poison: int = 0        # 修复后惩罚输入仍含 -1 的行数(真判据)
     penalty_input_rows_seen: int = 0
+    penalty_spec_poison: int = 0         # 其中 spec 段(out+spec 拼接的 spec 部分)行数
     repair_stat_calls: int = 0           # REPAIR STAT 行数(修复函数被调且有对象)
     repair_repaired: int = 0
     repair_prev_miss: int = 0
@@ -146,7 +147,8 @@ _RE_LAUNCH = re.compile(
 )
 _RE_OUT_OF_RANGE = re.compile(r"bincount OUT-OF-RANGE.*?min=(?P<min>-?\d+) max=(?P<max>-?\d+)")
 _RE_ACTIVE = re.compile(r"penalties ACTIVE(.*?poison_rows=(?P<poison>-?\d+))?")
-_RE_PENALTY_POISON = re.compile(r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)")
+_RE_PENALTY_POISON = re.compile(r"PENALTY INPUT POISON rows=(?P<hit>\d+)/(?P<total>\d+)(?: spec_rows=(?P<spec>\d+))?")
+_RE_SPEC_POISON = re.compile(r"spec_poison=(\d+)")
 _RE_REPAIR_STAT = re.compile(
     r"REPAIR STAT repaired=(?P<rep>\d+) prev_miss=(?P<pm>\d+) "
     r"tail_not_ph=(?P<tn>\d+) tail_clean=(?P<tc>\d+) empty_new=(?P<en>\d+) "
@@ -192,6 +194,8 @@ def analyze_line(line: str, rep: Report) -> None:
             rep.penalty_input_rows_seen += 1
     if (m := _RE_PENALTY_POISON.search(line)):
         rep.penalty_input_poison += int(m.group("hit"))
+    if (m := _RE_SPEC_POISON.search(line)):
+        rep.penalty_spec_poison += int(m.group(1))
     if (m := _RE_REPAIR_STAT.search(line)):
         rep.repair_stat_calls += 1
         rep.repair_repaired += int(m.group("rep"))
@@ -299,6 +303,21 @@ def verdict(rep: Report) -> tuple[str, list[str]]:
                 f"{rep.penalty_input_poison} 行(观测 {rep.penalty_input_rows_seen} 次)"
                 f"——占位修复链(update_async_output_token_ids)在云侧失效"
             )
+            # 分段定位:spec 段占满 → 毒走 spec_token_ids;否则 out 段滞留
+            if rep.penalty_spec_poison >= rep.penalty_input_poison * 0.8:
+                notes.append(
+                    f"分段:毒在 SPEC 段(spec_poison={rep.penalty_spec_poison} ≈ 总量)"
+                    "——update_async_spec_token_ids 只裁长不过滤 -1(草稿填充/陈旧行)"
+                )
+            elif rep.penalty_spec_poison == 0:
+                notes.append(
+                    "分段:毒在 OUT 段滞留(prev_miss 行未被修复)——查 prev 映射"
+                )
+            else:
+                notes.append(
+                    f"分段:混合(spec={rep.penalty_spec_poison} / 总="
+                    f"{rep.penalty_input_poison})——两类毒源并存"
+                )
         if rep.repair_stat_calls or rep.repair_bail_set_missing:
             branches = {
                 "set 侧未存引用(set_async_sampled_token_ids 链断)": rep.repair_bail_set_missing,
@@ -350,7 +369,7 @@ def render(rep: Report) -> str:
         f"penalties ACTIVE     : {rep.penalties_active}"
         + (f" (含 poison_rows 标注 {rep.penalty_input_rows_seen} 次)" if rep.penalty_input_rows_seen else ""),
         f"惩罚输入毒(真判据)   : {rep.penalty_input_poison} 行 / 观测 {rep.penalty_input_rows_seen} 次"
-        f"  [PENALTY INPUT POISON 命中即修复链失效]",
+        f" / 其中 spec 段 {rep.penalty_spec_poison} 行",
         f"修复链分支           : 调用 {rep.repair_stat_calls} 次 repaired={rep.repair_repaired} "
         f"prev_miss={rep.repair_prev_miss} tail_not_ph={rep.repair_tail_not_ph} "
         f"tail_clean={rep.repair_tail_clean} empty_new={rep.repair_empty_new} "
@@ -396,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
             "penalties_active": rep.penalties_active,
             "penalty_input_poison": rep.penalty_input_poison,
             "penalty_input_rows_seen": rep.penalty_input_rows_seen,
+            "penalty_spec_poison": rep.penalty_spec_poison,
             "repair_stat_calls": rep.repair_stat_calls,
             "repair_repaired": rep.repair_repaired,
             "repair_prev_miss": rep.repair_prev_miss,

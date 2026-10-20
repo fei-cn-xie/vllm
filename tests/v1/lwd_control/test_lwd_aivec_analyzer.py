@@ -158,6 +158,14 @@ VERDICT_CASES = [
         {"poison": 1, "penalty_input_poison": 0},
     ),
     VerdictCase(
+        "惩罚输入毒-spec段主导", [
+            ACTIVE + " poison_rows=3 spec_poison=3",
+            LAUNCH,
+            "[lwd][LWD][sampler-probe] PENALTY INPUT POISON rows=3/16 spec_rows=3",
+        ], "毒源仍在-静默污染",
+        {"penalty_input_poison": 3, "penalty_spec_poison": 3},
+    ),
+    VerdictCase(
         "惩罚输入毒-prev_miss主导-断点读数", [
             ACTIVE + " poison_rows=2",
             LAUNCH,
@@ -217,6 +225,7 @@ def _check_verdict(case: VerdictCase) -> None:
         assert rep.bincount_launches.observed_min == c.get("observed_min", rep.bincount_launches.observed_min)
         assert rep.fault_observed == c.get("fault", rep.fault_observed)
         assert rep.penalty_input_poison == c.get("penalty_input_poison", rep.penalty_input_poison)
+        assert rep.penalty_spec_poison == c.get("penalty_spec_poison", rep.penalty_spec_poison)
         assert rep.penalty_input_rows_seen == c.get("penalty_input_rows_seen", rep.penalty_input_rows_seen)
         assert rep.repair_stat_calls == c.get("repair_stat_calls", rep.repair_stat_calls)
         assert rep.repair_repaired == c.get("repair_repaired", rep.repair_repaired)
