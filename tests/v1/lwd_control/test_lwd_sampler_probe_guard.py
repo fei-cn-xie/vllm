@@ -33,3 +33,18 @@ def test_sampler_probe_stays_installed() -> None:
     assert "def lwd_install_sampler_probe() -> None:" in src
     assert "lwd_install_sampler_probe()" in src
     assert "bincount launch" in src and "OUT-OF-RANGE" in src
+
+
+def test_cloud_request_carries_block_hasher() -> None:
+    """2026-10-20 IndexError 事故:云侧 Request 无 hasher → block_hashes
+    恒空 → 首个满块 cache_full_blocks 越界。必须挂 mm 同款 hasher
+    (边侧链优先、本地回退),边侧必须打包链。"""
+    src = ENGINE.read_text(encoding="utf-8")
+    assert "_lwd_make_block_hasher" in src and "block_hasher=self._lwd_make_block_hasher" in src
+    assert "get_request_block_hasher" in src and "wire_hashes" in src
+    edge = (
+        Path(__file__).resolve().parents[3]
+        / "vllm" / "v1" / "lwd_control" / "control_edge_scheduler"
+        / "lwd_edge_engine.py"
+    ).read_text(encoding="utf-8")
+    assert "block_hashes=list(request.block_hashes)" in edge
