@@ -266,6 +266,16 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         判定;云侧无客户端 generation_config,传空)。"""
         values = {f: getattr(req_notify, f) for f in LWD_SAMPLING_DEFAULTS}
         values["stop_token_ids"] = list(values["stop_token_ids"])
+        # Penalties are neutralized on the cloud: the edge applies them at
+        # final sampling where the full token history lives. The cloud's
+        # prompt-token-id buffer is never filled (embeds-injected requests),
+        # so a penalty-carrying request sent the sample-penalties kernel
+        # reading uninitialized ids - a negative garbage value passed the
+        # kernel's vocab bound and faulted with an aivec MTE invalid-GM
+        # error on multi-request runs (2026-10-20).
+        values["repetition_penalty"] = 1.0
+        values["presence_penalty"] = 0.0
+        values["frequency_penalty"] = 0.0
         sampling_params = SamplingParams(**values)
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
