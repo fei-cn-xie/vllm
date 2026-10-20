@@ -108,6 +108,9 @@ class Report:
     penalty_input_rows_seen: int = 0
     penalty_spec_poison: int = 0         # 其中 spec 段(out+spec 拼接的 spec 部分)行数
     poison_row0_steps: int = 0           # 毒行含批内第 0 行的步数(崩溃前置①)
+    counts_returns: int = 0              # bincount 返回地址观测次数
+    counts_align2m: int = 0              # 其中 2MB 段对齐(段起点形态)次数
+    first_launch_mem: str | None = None  # 首次 launch 显存池快照(布局差异)
     repair_stat_calls: int = 0           # REPAIR STAT 行数(修复函数被调且有对象)
     repair_repaired: int = 0
     repair_prev_miss: int = 0
@@ -159,6 +162,10 @@ _RE_REPAIR_STAT = re.compile(
     r"prev_map=(?P<pmap>\d+) rows=(?P<rows>\d+)"
 )
 _RE_REPAIR_BAIL = re.compile(r"REPAIR BAIL set_missing=(?P<sm>\d+)")
+_RE_COUNTS_RET = re.compile(
+    r"bincount return counts_ptr=(?P<ptr>0x[0-9a-fA-F]+) align2m=(?P<a>\d)"
+)
+_RE_FIRST_MEM = re.compile(r"bincount first-launch mem reserved=(\d+) allocated=(\d+)")
 _RE_WIRE = re.compile(
     r"wire penalties req=(?P<req>\S+) rep=(?P<rep>-?[\d.]+) "
     r"pres=(?P<pres>-?[\d.]+) freq=(?P<freq>-?[\d.]+)"
@@ -211,6 +218,13 @@ def analyze_line(line: str, rep: Report) -> None:
         rep.repair_empty_new += int(m.group("en"))
     if _RE_REPAIR_BAIL.search(line):
         rep.repair_bail_set_missing += 1
+    if (m := _RE_COUNTS_RET.search(line)):
+        rep.counts_returns += 1
+        rep.counts_align2m += int(m.group("a"))
+    if (m := _RE_FIRST_MEM.search(line)):
+        rep.first_launch_mem = (
+            f"reserved={m.group(1)} allocated={m.group(2)}"
+        )
     if (m := _RE_LAUNCH.search(line)):
         s = rep.bincount_launches
         s.count += 1
@@ -420,6 +434,10 @@ def render_compare(base: Report, lwd: Report) -> str:
          f"{base.repair_stat_calls}/{base.repair_repaired}",
          f"{lwd.repair_stat_calls}/{lwd.repair_repaired}"),
         ("bincount launch", base.bincount_launches.count, lwd.bincount_launches.count),
+        ("  counts 2MB对齐/观测",
+         f"{base.counts_align2m}/{base.counts_returns}",
+         f"{lwd.counts_align2m}/{lwd.counts_returns}"),
+        ("  首launch显存池", base.first_launch_mem or "-", lwd.first_launch_mem or "-"),
         ("疑似故障行", fault_n(base), fault_n(lwd)),
     ]
     if base.penalty_input_poison > 0 and lwd.penalty_input_poison > 0:
@@ -479,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
             "penalty_input_rows_seen": rep.penalty_input_rows_seen,
             "penalty_spec_poison": rep.penalty_spec_poison,
             "poison_row0_steps": rep.poison_row0_steps,
+            "counts_returns": rep.counts_returns,
+            "counts_align2m": rep.counts_align2m,
+            "first_launch_mem": rep.first_launch_mem,
             "repair_stat_calls": rep.repair_stat_calls,
             "repair_repaired": rep.repair_repaired,
             "repair_prev_miss": rep.repair_prev_miss,
