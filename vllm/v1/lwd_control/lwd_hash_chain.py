@@ -14,11 +14,19 @@ module restores the chain OUTSIDE the frozen file so the freeze stands:
   never match another request's entries);
 - continuation, missing or length-mismatched chains fall back to the
   standard local hasher (fail-open), which also keeps the list long
-  enough for the block indexing.
+  enough for the block indexing;
+- the cloud's prompt_embeds is a meta tensor (no storage; the migration
+  switched from mm's zero buffers to meta to keep 35MB+ payloads off the
+  MQ overflow path). The fallback hasher reads embeds data via
+  _gen_prompt_embeds_extra_hash_keys, which raises NotImplementedError on
+  a meta tensor. The fix: pre-fill the per-block embeds-hash cache for
+  every block the fallback is about to hash, so the lazy path hits the
+  cache and never touches the meta tensor.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -51,10 +59,32 @@ def lwd_cloud_block_hasher(
     fallback = get_request_block_hasher(hash_block_size, caching_hash_fn)
     wire = list(wire_hashes)
 
+    def _prefill_meta_embeds_cache(request: "Request") -> None:
+        """Pre-fill the per-block embeds-hash cache for every block the
+        fallback hasher is about to hash.
+
+        The fallback iterates from len(block_hashes) * hash_block_size
+        while start + hash_block_size <= num_tokens; mirror that walk and
+        seed the cache dict, so the lazy path in
+        _gen_prompt_embeds_extra_hash_keys hits the cache and never calls
+        .cpu() on the meta tensor. The hash value salts on request_id:
+        different requests never share embeds hashes, preventing false
+        prefix-cache hits (the meta tensor carries no content to hash).
+        """
+        start = len(request.block_hashes) * hash_block_size
+        while start + hash_block_size <= request.num_tokens:
+            key = (start, start + hash_block_size)
+            if key not in request._prompt_embeds_per_block_hashes:
+                request._prompt_embeds_per_block_hashes[key] = hashlib.sha256(
+                    f"lwd-meta:{request.request_id}:{start}".encode()
+                ).digest()
+            start += hash_block_size
+
     def hasher(request: "Request") -> list[Any]:
         if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
             if len(wire) == request.num_prompt_tokens // hash_block_size:
                 return wire
+        _prefill_meta_embeds_cache(request)
         return fallback(request)
 
     return hasher

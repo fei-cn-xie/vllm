@@ -64,3 +64,20 @@ def test_hash_chain_imports_resolve(tmp_path=None) -> None:
     ).read_text(encoding="utf-8")
     assert "from vllm.utils.hashing import get_hash_fn_by_name" in chain
     assert "init_none_hash" in chain and "resolve_kv_cache_block_sizes" in chain
+
+
+def test_hash_chain_prefills_meta_embeds_cache() -> None:
+    """2026-10-20 meta tensor 事故:云侧 prompt_embeds 是 meta 张量(无存储),
+    本地哈希回退读 .cpu() 必炸;必须在回退前预填 _prompt_embeds_per_block_hashes
+    让惰性路径命中缓存、跳过读数据。哈希值带 request_id 盐,防假命中。"""
+    chain = (
+        Path(__file__).resolve().parents[3]
+        / "vllm" / "v1" / "lwd_control" / "lwd_hash_chain.py"
+    ).read_text(encoding="utf-8")
+    assert "_prefill_meta_embeds_cache" in chain
+    assert "_prompt_embeds_per_block_hashes" in chain
+    assert "request_id" in chain  # 盐:不同请求不共享 embeds 哈希
+    # 预填必须在 fallback 之前
+    assert chain.index("_prefill_meta_embeds_cache(request)") < chain.index(
+        "return fallback(request)"
+    )
