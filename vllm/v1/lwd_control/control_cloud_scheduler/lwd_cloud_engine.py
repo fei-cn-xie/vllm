@@ -22,6 +22,7 @@ from vllm.v1.engine.core import EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
+from vllm.v1.lwd_control.lwd_hash_chain import lwd_cloud_block_hasher
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
@@ -326,49 +327,13 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
-            block_hasher=self._lwd_make_block_hasher(req_notify),
+            block_hasher=lwd_cloud_block_hasher(
+                self.vllm_config,
+                self.scheduler.kv_cache_config,
+                req_notify.block_hashes,
+            ),
         )
         return request
-
-    def _lwd_make_block_hasher(self, req_notify: LwdRequestNotify):
-        """Block-hash chain for the embeds-only cloud request (mm parity).
-
-        First build uses the edge-computed wire chain (its hashes are over
-        the REAL token ids; local hashing over the zero placeholders would
-        never match another request's entries); continuation, missing or
-        length-mismatched chains fall back to the standard local hasher
-        (fail-open) - which also keeps the hash list long enough for
-        cache_full_blocks indexing, the 2026-10-20 IndexError crash.
-        Without any hasher the chain stays empty forever and the first
-        full block crashes the scheduler.
-        """
-        if not self.vllm_config.cache_config.enable_prefix_caching:
-            return None
-        from vllm.v1.core.kv_cache_utils import (
-            get_hash_fn_by_name,
-            get_request_block_hasher,
-            init_none_hash,
-            resolve_kv_cache_block_sizes,
-        )
-
-        _, hash_block_size = resolve_kv_cache_block_sizes(
-            self.scheduler.kv_cache_config, self.vllm_config
-        )
-        caching_hash_fn = get_hash_fn_by_name(
-            self.vllm_config.cache_config.prefix_caching_hash_algo
-        )
-        init_none_hash(caching_hash_fn)
-        local_hasher = get_request_block_hasher(hash_block_size, caching_hash_fn)
-        wire_hashes = list(req_notify.block_hashes)
-
-        def block_hasher(request: Request) -> list:
-            if len(request.block_hashes) == 0 and request.num_output_tokens == 0:
-                expected = request.num_prompt_tokens // hash_block_size
-                if len(wire_hashes) == expected:
-                    return wire_hashes
-            return local_hasher(request)
-
-        return block_hasher
 
     @staticmethod
     def _lwd_build_sampling_params(req_notify: LwdRequestNotify) -> SamplingParams:

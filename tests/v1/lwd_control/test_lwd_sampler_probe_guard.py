@@ -40,8 +40,12 @@ def test_cloud_request_carries_block_hasher() -> None:
     恒空 → 首个满块 cache_full_blocks 越界。必须挂 mm 同款 hasher
     (边侧链优先、本地回退),边侧必须打包链。"""
     src = ENGINE.read_text(encoding="utf-8")
-    assert "_lwd_make_block_hasher" in src and "block_hasher=self._lwd_make_block_hasher" in src
-    assert "get_request_block_hasher" in src and "wire_hashes" in src
+    assert "lwd_cloud_block_hasher(" in src and "req_notify.block_hashes," in src
+    chain = (
+        Path(__file__).resolve().parents[3]
+        / "vllm" / "v1" / "lwd_control" / "lwd_hash_chain.py"
+    ).read_text(encoding="utf-8")
+    assert "get_request_block_hasher" in chain and "wire" in chain
     edge = (
         Path(__file__).resolve().parents[3]
         / "vllm" / "v1" / "lwd_control" / "control_edge_scheduler"
