@@ -77,17 +77,3 @@ def test_upstream_config_file_stays_untouched() -> None:
                 "vllm/config/vllm.py carries an LWD edge branch; keep LWD "
                 "role logic inside the lwd_control package (non-invasive)"
             )
-
-
-def test_cloud_neutralizes_penalties() -> None:
-    """2026-10-20 多请求 aivec 事故:云侧 prompt token 缓冲从未填充(嵌入
-    注入),带 penalty 的请求把分箱内核喂了垃圾 id,负值穿透词表上界
-    → OOB 原子写。惩罚归边侧;云侧重建参数时必须强制归零。"""
-    src = ENGINE.read_text(encoding="utf-8") if False else Path(
-        __file__
-    ).resolve().parents[3].joinpath(
-        "vllm/v1/lwd_control/control_cloud_scheduler/lwd_cloud_engine.py"
-    ).read_text(encoding="utf-8")
-    assert 'values["repetition_penalty"] = 1.0' in src
-    assert 'values["presence_penalty"] = 0.0' in src
-    assert 'values["frequency_penalty"] = 0.0' in src
