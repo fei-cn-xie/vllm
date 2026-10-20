@@ -30,6 +30,11 @@ from vllm.v1.sample.thinking_budget_state import (
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 
+# 2026-10-20 aivec 复现性排查:毒值驻留扫描预算(每次 spec 更新消耗 1;
+# 纯 CPU 扫描零设备同步,定论后随 spec-probe 一起删除)
+_LWD_RESIDENCY_SCAN_BUDGET = 2000
+_lwd_residency_left = [_LWD_RESIDENCY_SCAN_BUDGET]
+
 
 @dataclass
 class CachedRequestState:
@@ -535,6 +540,26 @@ class InputBatch:
         self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
         self.is_token_ids[req_index, start_index:end_token_index] = True
         cur_spec_token_ids.extend(spec_token_ids)
+        # 2026-10-20 aivec 复现性排查续:崩溃本身是三重彩票(毒值在批内
+        # 首行 + bin_counts 恰落段边界才 fault),"不崩"无判别力,改为直接
+        # 检测毒值驻留:token_ids_cpu 初始化为 0,行内任何 -1 必来自写入
+        # (MTP/spec 哨兵)。纯 CPU numpy 比较,零设备同步,不扰时序。
+        # prompt 区命中 = 写入越界路线;真实输出区命中 = 占位未被覆写路线。
+        if _lwd_residency_left[0] > 0:
+            _lwd_residency_left[0] -= 1
+            row = self.token_ids_cpu[req_index]
+            end_real = int(self.num_tokens_no_spec[req_index])
+            prompt_hits = int((row[:num_prompt] < 0).sum())
+            output_hits = int((row[num_prompt:end_real] < 0).sum())
+            if prompt_hits or output_hits:
+                from vllm.lwd_logger import lwd_logger
+                lwd_logger.warning(
+                    "[LWD][spec-probe] POISON RESIDENT req=%s idx=%d "
+                    "prompt_-1=%d output_-1=%d prompt_len=%d real=%d "
+                    "start=%d num_spec=%d",
+                    req_id, req_index, prompt_hits, output_hits,
+                    num_prompt, end_real, start_index, num_spec_tokens,
+                )
 
     def remove_request(self, req_id: str) -> int | None:
         """This method must always be followed by a call to condense().
