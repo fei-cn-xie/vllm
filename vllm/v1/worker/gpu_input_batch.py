@@ -30,14 +30,19 @@ from vllm.v1.sample.thinking_budget_state import (
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable, SlotMappingMode
 
+import os
+
 # 2026-10-20 aivec 复现性排查:毒值驻留扫描预算(每次 spec 更新消耗 1;
-# 纯 CPU 扫描零设备同步,定论后随 spec-probe 一起删除)
-_LWD_RESIDENCY_SCAN_BUDGET = 2000
+# 纯 CPU 扫描零设备同步,定论后随 spec-probe 一起删除)。
+# 2026-10-21 教训:默认 2000/进程 × 4 rank = 8000,长压测中途耗尽,崩溃
+# 窗口(后段)无覆盖——"prompt 区干净"只对前段成立。预算改为环境变量
+# 可调,取证期间调大。
+_LWD_RESIDENCY_SCAN_BUDGET = int(os.getenv("VLLM_LWD_RESIDENCY_SCAN_BUDGET", "2000"))
 _lwd_residency_left = [_LWD_RESIDENCY_SCAN_BUDGET]
 
 # 排查续③:修复链 bail 分支计数预算(update_async_output_token_ids
 # 每次调用消耗 1;实测惩罚输入仍含 -1,本计数直接报出静默 bail 的分支)
-_LWD_REPAIR_LOG_BUDGET = 2000
+_LWD_REPAIR_LOG_BUDGET = int(os.getenv("VLLM_LWD_REPAIR_LOG_BUDGET", "2000"))
 _lwd_repair_log_left = [_LWD_REPAIR_LOG_BUDGET]
 
 
