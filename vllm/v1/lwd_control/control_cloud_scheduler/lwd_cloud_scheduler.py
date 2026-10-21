@@ -91,6 +91,21 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier = getattr(model_runner_output, "lwd_down_carrier", None)
         if carrier is not None:
             meta = self._lwd_carrier_to_meta(carrier)
+            # Deliver committed counts (same source as the finish
+            # decision): collector counts are device-side derivatives
+            # without check_stop truncation (stop/EOS/max_tokens), and
+            # the edge delivery path performs no local stop check — the
+            # delivered count must be same-source with the finish
+            # decision. Requests absent from the outputs get 0 (the
+            # edge's pad-and-skip disposition handles them).
+            committed = {
+                out.request_id: len(out.new_token_ids)
+                for outputs in engine_core_outputs.values()
+                for out in outputs.outputs
+            }
+            meta.num_accepted_tokens = [
+                committed.get(rid, 0) for rid in meta.req_ids
+            ]
             LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
@@ -153,9 +168,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_carrier_to_meta(carrier):
-        """Unpack the pinned payload into step metadata.
+        """Unpack the harvested payload into step metadata.
 
-        Payload = a flat int tensor pinned after cloud-side collection,
+        Payload = a flat int tensor (CPU, harvested by the worker's
+        fenced copy: dedicated stream wait_event on the per-step ready
+        event, completion event recorded on the copy stream itself),
         laid out as "variable-length segments first, fixed-length tails
         last", so it can be decoded backwards from the tail without
         carrying extra length fields:
@@ -176,9 +193,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
         seg_lens segment"."""
         from vllm.v1.outputs import LwdC2eMeta
 
-        pinned, req_ids, hidden_numel, seqno = carrier
+        packed, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
-        vals = pinned.tolist()
+        vals = packed.tolist()
         counts = vals[-2 * n_req : -n_req]
         seg_lens = vals[-n_req:]
         ranks_flat = vals[: -2 * n_req]
