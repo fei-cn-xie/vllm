@@ -232,34 +232,64 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
         }
 
+    @staticmethod
+    def _lwd_row_disposition(
+        accepted: int, has_tokens: bool, finished: bool
+    ) -> str:
+        """逐行交付裁定(pad-and-skip,移植自 mm 分支 7ff2ddc3e):
+
+        - "skip":零接受活行(accepted=0 且未完结)——混排步中 prefill 请求
+          在采样布局只占预留槽(Ascend MTP 采样只回填 draft 参与行),
+          收集器按 (sampled != -1).sum() 计得 accepted=0。这类行是混排
+          的协议伪影,通告里保留只为 DOWN 张量对位:不交付、不 ERROR、
+          不标记首 token(修复前此形态被 ERROR 杀请求);
+        - "error":声明 accepted>0 却无 token = unembed 真失败,ERROR
+          优先于云侧完成码(原语义保留);
+        - "deliver":其余(含零接受但带完结码的收尾行——终结信号必须
+          透传,吞掉会丢完结)。"""
+        if accepted == 0 and not finished:
+            return "skip"
+        if not has_tokens and not finished:
+            return "error"
+        return "deliver"
+
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
     ) -> tuple[list[EngineCoreOutput], set[str]]:
-        """逐请求交付:token 行缺席且未完结 = unembed 失败,ERROR 优先
-        于云侧完成码;不在 awaiting 的迟到结果幂等丢弃。"""
+        """逐请求交付:行裁定走 _lwd_row_disposition(零接受活行跳过,
+        accepted>0 缺 token 才 ERROR);不在 awaiting 的迟到结果幂等丢弃。"""
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
+        # accepted 与行按位对齐(lwd_build_unembed_batch 同契约);
+        # DISABLE_DOWN 旁路不带 accepted,以回填 token 有无代替
+        accepts = notify.num_accepted_tokens
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
+            accepted = (
+                accepts[index] if accepts
+                else (1 if sampled_token_ids else 0)
+            )
+            disposition = self._lwd_row_disposition(
+                accepted, bool(sampled_token_ids), finished_now
+            )
+            if disposition == "skip":
+                # 零接受活行:不交付不出空输出,也无谓打调试税
+                continue
             LwdControlDiag.edge_tokens_delivered(
                 request_id,
                 sampled_token_ids,
                 finish_reason,
                 self.vllm_config,
             )
-            if not sampled_token_ids and not finished_now:
+            if disposition == "error":
                 # [Lwd][eos-trace] B 点:kill 行留痕,按 down_seqno 与
                 # A(云零接受行)/C(worker 缺行)配对定案根因
                 LwdControlDiag.trace_edge_kill_row(
                     seqno=notify.down_seqno,
                     rid=request_id,
-                    accepted=(
-                        notify.num_accepted_tokens[index]
-                        if index < len(notify.num_accepted_tokens)
-                        else -1
-                    ),
+                    accepted=accepted,
                     finish_code=(
                         notify.finish_reasons[index] if notify.finish_reasons else -1
                     ),
@@ -276,8 +306,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 continue
-            if not sampled_token_ids and not finished_now:
-                continue  # 无内容且未完结:不出空输出
             if finished_now:
                 # 云端判停的地面真相落地:原生 finish 清账(KV/缓存释放
                 # 与 finished_req_ids 交接全走原生)
