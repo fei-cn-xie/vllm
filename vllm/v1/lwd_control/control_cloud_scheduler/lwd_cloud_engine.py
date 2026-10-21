@@ -69,25 +69,27 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
         self._lwd_hint_mq = create_hint_mq()
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
-        # The cloud endpoint worker published its done-report MQ handle to
-        # the shared world's TCP store during init_device (the same
-        # rendezvous at master_addr:master_port the HCCL world joins);
-        # acquire the reader here - the workers are ready, so the key is
-        # set. This keeps the vllm executor entirely free of LWD plumbing.
-        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import acquire_done_mq
+        # The cloud endpoint worker created its done-report MQ during
+        # init_device; now that the executor is up, fetch its handle over
+        # the executor's collective RPC (the executor itself stays free of
+        # LWD plumbing). Exactly one worker - the endpoint rank - must
+        # report a handle; anything else is a wiring error.
+        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-        from vllm.utils.network_utils import get_distributed_init_method
-
-        parallel_config = self.vllm_config.parallel_config
-        self._lwd_done_mq = acquire_done_mq(
-            get_distributed_init_method(
-                parallel_config.master_addr, parallel_config.master_port
+        handles = [
+            handle
+            for handle in self.model_executor.collective_rpc(
+                "lwd_early_recv_done_handle"
             )
-        )
-        lwd_logger.info(
-            "[pre-recv] hint MQ created by engine, done MQ attached: %s",
-            "OK" if self._lwd_done_mq is not None else "NONE",
-        )
+            if handle is not None
+        ]
+        if len(handles) != 1:
+            raise RuntimeError(
+                "[LWD] early receive expects one endpoint worker reporting "
+                f"completions, got {len(handles)}"
+            )
+        self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
+        lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
 
     def _lwd_assemble(self) -> None:
         self._lwd_ingest_thread: threading.Thread | None = None
