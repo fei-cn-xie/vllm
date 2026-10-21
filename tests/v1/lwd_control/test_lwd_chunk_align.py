@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""chunk 对齐 profile 测试(2026-10 lwd-debug-1019 INJECT window mismatch
-回归):采纳/校验逻辑任何解释器可跑;结构体字段表、引擎接线、上游
-split 属性读取面用 AST 源码守卫冻结;真实 `_mamba_block_aligned_split`
-等价复现为表驱动执行用例(需 torch + vllm 可导入,轻量环境按条件跳过,
-真实环境补跑)。
+"""chunk alignment profile tests (2026-10 lwd-debug-1019 INJECT window
+mismatch regression): the adoption/validation logic runs on any
+interpreter; the struct field table, the engine wiring, and the upstream
+split attribute-read surface are frozen by AST source guards; the real
+`_mamba_block_aligned_split` is reproduced equivalently as table-driven
+execution cases (needs torch + vllm importable; lightweight environments
+skip conditionally and re-run in the real environment).
 
-事故形态:边侧 chunk 划分权威,云侧按钳制参数复现;但云侧原生
-schedule() 的 mamba 块对齐把 1561 截到 1536(块 128 对齐),边侧按
-1561 发 embeds -> 云侧 INJECT 窗口校验 rows=1561 != scheduled=1536
-崩溃。修法:LwdCloudParamsNotify 下发云侧对齐 profile,边侧采纳到
-调度器,边侧原生 schedule() 跑同一段上游代码完成同款截断。
+Incident shape: the edge side is the chunk partitioning authority and the
+cloud side reproduces it from the clamping parameters; but the cloud-native
+schedule() mamba block alignment truncated 1561 down to 1536 (block-128
+aligned) while the edge side sent embeds for 1561 -> the cloud INJECT
+window validation crashed on rows=1561 != scheduled=1536. Fix:
+LwdCloudParamsNotify ships the cloud alignment profile, the edge side
+adopts it into the scheduler, and the edge-native schedule() runs the
+same upstream code to perform the identical truncation.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ EDGE_ENGINE = (
 
 
 def make_profile(**overrides) -> SimpleNamespace:
-    """云侧实况值(Qwen3.6-27B + qwen3_5_mtp 部署形态)的 stub。"""
+    """Stub of real cloud-side values (Qwen3.6-27B + qwen3_5_mtp deployment shape)."""
     fields = {
         "block_size": 128,
         "hash_block_size": 128,
@@ -59,7 +64,7 @@ def make_profile(**overrides) -> SimpleNamespace:
 
 
 def make_edge_scheduler() -> SimpleNamespace:
-    """边侧调度器 stub:init 派生值全是"无 mamba/无 spec"的边侧形态。"""
+    """Edge scheduler stub: init-derived values are all in the "no mamba / no spec" edge shape."""
     sched = SimpleNamespace(
         hash_block_size=128,
         need_mamba_block_aligned_split=False,
@@ -78,7 +83,7 @@ def make_cache(block_size: int = 128) -> SimpleNamespace:
 
 
 def test_apply_stamps_all_adopt_attrs():
-    """采纳:7 个属性全部盖成云侧值;hash 尺寸保持边侧原值(仅校验)。"""
+    """Adoption: all 7 attributes are stamped to cloud values; hash size keeps the edge's original value (validation only)."""
     sched = make_edge_scheduler()
     profile = make_profile()
     lwd_apply_chunk_align_profile(sched, make_cache(), profile)
@@ -88,11 +93,11 @@ def test_apply_stamps_all_adopt_attrs():
 
 
 def test_apply_block_size_mismatch_raises():
-    """块尺寸不一致 = 部署错位,fail-fast 而非静默采纳错值。"""
+    """Block size mismatch = deployment misalignment; fail fast instead of silently adopting wrong values."""
     sched = make_edge_scheduler()
     with pytest.raises(RuntimeError, match="block size mismatch"):
         lwd_apply_chunk_align_profile(sched, make_cache(16), make_profile())
-    # 失败路径不得部分盖章
+    # The failure path must not partially stamp values
     assert sched.need_mamba_block_aligned_split is False
 
 
@@ -104,7 +109,7 @@ def test_apply_hash_block_size_mismatch_raises():
 
 
 # --------------------------------------------------------------------- #
-# AST 源码守卫:任何主机可跑                                            #
+# AST source guards: runnable on any host                                 #
 # --------------------------------------------------------------------- #
 
 def _struct_fields(path: Path, class_name: str) -> set[str]:
@@ -121,13 +126,13 @@ def _struct_fields(path: Path, class_name: str) -> set[str]:
 
 
 def test_struct_fields_match_adopt_attrs():
-    """结构体字段 == 校验位(block/hash) + 采纳位,两侧不许漂移。"""
+    """Struct fields == validation bits (block/hash) + adoption bits; the two sides must not drift."""
     fields = _struct_fields(MESSAGES, "LwdChunkAlignProfile")
     assert fields == {"block_size", "hash_block_size"} | set(LWD_CHUNK_ALIGN_ADOPT_ATTRS)
 
 
 def test_cloud_params_chunk_align_defaults_to_none():
-    """chunk_align 带默认 None:旧云编码可解码,边侧据此报版本错位。"""
+    """chunk_align defaults to None: payloads encoded by older clouds stay decodable, and the edge reports version skew accordingly."""
     tree = ast.parse(MESSAGES.read_text(encoding="utf-8"))
     node = next(
         n for n in tree.body
@@ -138,26 +143,28 @@ def test_cloud_params_chunk_align_defaults_to_none():
         if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
     }
     assert "chunk_align" in fields
-    assert fields["chunk_align"].value is not None, "chunk_align 必须带默认值"
+    assert fields["chunk_align"].value is not None, "chunk_align must carry a default value"
 
 
 def test_engines_wire_profile():
-    """接线守卫:云侧必填、边侧必采纳且对 None fail-fast。"""
+    """Wiring guard: the cloud must fill it in, the edge must adopt it and fail fast on None."""
     cloud = CLOUD_ENGINE.read_text(encoding="utf-8")
     assert "lwd_build_chunk_align_profile(" in cloud
     assert "self.scheduler" in cloud and "cache_config" in cloud
     edge = EDGE_ENGINE.read_text(encoding="utf-8")
     assert "lwd_apply_chunk_align_profile(" in edge
-    assert re.search(r"chunk_align is None", edge), "缺 None fail-fast"
+    assert re.search(r"chunk_align is None", edge), "missing None fail-fast"
 
 
 def test_split_attr_reads_covered_by_profile():
-    """漂移绊线:上游 split 新读任何 self 属性都必须进 profile 面。
+    """Drift tripwire: any new self attribute read by the upstream split
+    must enter the profile surface.
 
-    `_mamba_block_aligned_split` 只许读:上下文(cache_config/
-    scheduler_config/max_num_scheduled_tokens)、校验位 hash_block_size、
-    采纳位。出现新属性 = 云侧又多一个边侧不知道的截断输入,本守卫
-    先于现场崩溃报警。
+    `_mamba_block_aligned_split` may only read: context (cache_config/
+    scheduler_config/max_num_scheduled_tokens), the validation bit
+    hash_block_size, and the adoption bits. A new attribute = the cloud
+    gained one more truncation input the edge does not know about; this
+    guard raises the alarm before the on-site crash.
     """
     tree = ast.parse(SCHEDULER.read_text(encoding="utf-8"))
     fn = next(
@@ -171,11 +178,11 @@ def test_split_attr_reads_covered_by_profile():
          "hash_block_size"}
         | set(LWD_CHUNK_ALIGN_ADOPT_ATTRS)
     )
-    assert reads <= allowed, f"split 新读属性 {reads - allowed}: 需扩 profile"
+    assert reads <= allowed, f"split newly reads attributes {reads - allowed}: profile must be extended"
 
 
 # --------------------------------------------------------------------- #
-# 真实 split 等价复现(需 torch;轻量环境跳过,真实环境补跑)            #
+# Real split equivalence reproduction (needs torch; skipped in lightweight envs, re-run in the real env) #
 # --------------------------------------------------------------------- #
 
 try:
@@ -186,12 +193,12 @@ except Exception:  # pragma: no cover
 
 needs_scheduler = pytest.mark.skipif(
     SCHEDULER_CLS is None,
-    reason="需真实环境(Python>=3.10 + torch,vllm.v1.core.sched 可导入)补跑",
+    reason="re-run in the real environment (Python>=3.10 + torch, vllm.v1.core.sched importable)",
 )
 
 
 def _split_self(profile: SimpleNamespace, threshold: int = 8192) -> SimpleNamespace:
-    """携带 split 读取面全量属性的 stub self(属性集由守卫测试冻结)。"""
+    """Stub self carrying the full split attribute-read surface (attribute set frozen by the guard test)."""
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=profile.block_size),
         hash_block_size=profile.hash_block_size,
@@ -207,30 +214,33 @@ def _split_self(profile: SimpleNamespace, threshold: int = 8192) -> SimpleNamesp
 @pytest.mark.parametrize(
     ("prompt_len", "start", "num_new", "want", "profile_overrides"),
     [
-        # 事故实录:mid-prompt 预算截断块 1561 -> 128 对齐截 1536
+        # Incident record: mid-prompt budget-truncated chunk 1561 -> cut to 1536 by 128 alignment
         (4096, 0, 1561, 1536, {}),
-        # 已对齐的 chunk 原样通过
+        # An already-aligned chunk passes through unchanged
         (4096, 0, 2048, 2048, {}),
-        # 块内起点:先停到下一块边界(前缀命中后起点不入块的形态)
+        # Start inside a block: stop at the next block boundary first (shape where a prefix hit leaves the start mid-block)
         (4096, 100, 2048, 28, {}),
-        # 末块豁免对齐截断,但 eagle 退一块的 last_cache_position 停点咬合
-        # (1561%128=25:last=1536,eagle 退一块 -> 1408)
+        # Final block is exempt from alignment truncation, but the stop point meshes with
+        # eagle's one-block drop of last_cache_position (1561%128=25: last=1536, eagle drops one block -> 1408)
         (1561, 0, 1561, 1408, {}),
-        # 同上,关 eagle 退块:停 1536,余 25 逐块收尾(锁定退块差量)
+        # Same as above with eagle block-drop off: stops at 1536, the remaining 25 finishes
+        # block by block (locks in the block-drop delta)
         (1561, 0, 1561, 1536, {"use_eagle_block_drop": False}),
-        # 从退块位置续跑的末块:停点不严格落段内,整段放行
+        # Final block resumed from the dropped-block position: the stop point does not
+        # strictly fall inside the segment, so the whole segment is admitted
         (1600, 1408, 192, 192, {}),
-        # 块内起点的末块:逐块 stepping 到边界
+        # Final block with an in-block start: steps block by block up to the boundary
         (1600, 1440, 160, 96, {}),
-        # 剩余额度不足跨块:对齐后为 0(本步跳过,下步整块再排)
+        # Remaining budget cannot cross a block: aligned result is 0 (skipped this step; the whole block is scheduled next step)
         (4096, 0, 100, 0, {}),
     ],
 )
 def test_split_reproduces_cloud_cuts(
     prompt_len, start, num_new, want, profile_overrides
 ):
-    """云侧原生值 vs 边侧采纳值跑同一段上游 split,输出必须相等且等于
-    表值——边侧从此在发 embeds 之前就切出云侧将排的窗口。"""
+    """Cloud-native values vs edge-adopted values run the same upstream
+    split; the outputs must be equal and match the table values — the
+    edge now cuts the window the cloud will schedule before sending embeds."""
     profile = make_profile(**profile_overrides)
     request = SimpleNamespace(
         num_computed_tokens=start,
@@ -260,18 +270,19 @@ def test_split_reproduces_cloud_cuts(
 @pytest.mark.parametrize(
     ("num_tokens", "computed", "num_new", "lookahead", "want"),
     [
-        # 多模组 MTP:chunk 端点距 prefill 末 2 < lookahead 3 -> 收 1
+        # Multi-module MTP: chunk endpoint is 2 from the prefill tail, 2 < lookahead 3 -> trim 1
         (1538, 0, 1536, 3, 1535),
-        # 端点即末尾(remaining=0)-> 放行
+        # Endpoint is exactly the tail (remaining=0) -> admitted as-is
         (1538, 0, 1538, 3, 1538),
-        # 边侧无 spec(lookahead=0,采纳前形态)-> 放行;采纳后与云同款收法
+        # Edge without spec (lookahead=0, pre-adoption shape) -> admitted as-is;
+        # after adoption it trims the same way as the cloud
         (1538, 0, 1536, 0, 1536),
     ],
 )
 def test_reserve_prefill_lookahead_reproduces(
     num_tokens, computed, num_new, lookahead, want
 ):
-    """lookahead 预留随 profile 采纳:边侧与云侧同式收 chunk。"""
+    """lookahead reservation is adopted with the profile: edge and cloud trim the chunk the same way."""
     request = SimpleNamespace(
         num_tokens=num_tokens,
         num_computed_tokens=computed,

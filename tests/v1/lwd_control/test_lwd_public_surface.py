@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""外部接入面守卫测试 + 包内依赖方向守卫。
+"""Public surface guard tests + intra-package dependency direction guards.
 
-core.py 内联读 vllm_config.lwd_config 选引擎类;serve.py 不再接触
-lwd_control;重量级模块(需 torch 的引擎/调度器)以 find_spec 断言
-存在性,不触发执行。
+core.py reads vllm_config.lwd_config inline to select the engine class;
+serve.py no longer touches lwd_control; heavyweight modules (torch-
+requiring engines/schedulers) have their existence asserted via
+find_spec, without triggering execution.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import pytest
 try:
     from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 except Exception:  # pragma: no cover
-    pytest.skip("vllm 包入口不可导入", allow_module_level=True)
+    pytest.skip("vllm package entry not importable", allow_module_level=True)
 
 assert callable(LwdControlDiag.token_passthrough_enabled)
 assert callable(LwdControlDiag.disable_down_enabled)
@@ -34,7 +35,7 @@ def _spec(name: str):
 
 
 def test_module_inventory():
-    """核心模块存在性(不触发 torch 依赖的执行)。"""
+    """Core module existence (does not trigger torch-dependent execution)."""
     for name in [
         "vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler",
         "vllm.v1.lwd_control.control_scheduler.lwd_chunk_align",
@@ -49,7 +50,7 @@ def test_module_inventory():
 
 
 def test_deleted_modules_gone():
-    """PD 分离相位机、旧配置/台账模块已删,不可再 import。"""
+    """PD-disaggregation phase machine and legacy config/ledger modules are deleted and must not be importable."""
     for name in [
         "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler",
         "vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble",
@@ -60,7 +61,7 @@ def test_deleted_modules_gone():
 
 
 def test_external_entry_sites():
-    """core.py 内联选择块在;serve.py 零 lwd_control 引用。"""
+    """core.py keeps the inline selection block; serve.py has zero lwd_control references."""
     core = (VLLM_DIR / "v1" / "engine" / "core.py").read_text()
     assert "vllm_config.lwd_config" in core
     assert "LwdEdgeEngineCore" in core and "LwdCloudEngineCore" in core
@@ -69,8 +70,9 @@ def test_external_entry_sites():
 
 
 def test_cloud_scheduler_keeps_debug_static_method():
-    """lwd_debug 引用的静态方法名仍在(文本守卫,免 torch);core.py 无
-    LWD 模型输出钩子(c2e 收编调度器 update_from_output + 引擎 post_step)。"""
+    """Static method names referenced by lwd_debug still exist (text
+    guard, torch-free); core.py has no LWD model output hooks (c2e is
+    folded into scheduler update_from_output + engine post_step)."""
     source = (
         VLLM_DIR
         / "v1"
@@ -85,7 +87,7 @@ def test_cloud_scheduler_keeps_debug_static_method():
 
 
 def test_cloud_package_never_imports_edge_package():
-    """依赖方向守卫:云侧包禁止 import 边侧包。"""
+    """Dependency direction guard: the cloud package must not import the edge package."""
     cloud_dir = VLLM_DIR / "v1" / "lwd_control" / "control_cloud_scheduler"
     offenders = [
         py.name
@@ -96,11 +98,13 @@ def test_cloud_package_never_imports_edge_package():
 
 
 def test_diag_package_purity():
-    """诊断包纯度:零功能依赖(不 import 调度/引擎/通信类),不持
-    执行适配器(future/伪输出归引擎);违者即诊断与功能再次糅合。"""
+    """Diagnostics package purity: zero functional dependencies (no
+    scheduler/engine/comm imports), no execution adapters (future/stub
+    output belong to the engine); a violation means diagnostics and
+    functionality are re-entangled."""
     diag_dir = VLLM_DIR / "v1" / "lwd_control" / "lwd_control_diag"
     files = list(diag_dir.glob("*.py"))
-    assert files, "lwd_control_diag 包缺失"
+    assert files, "lwd_control_diag package missing"
     banned = (
         "control_edge_scheduler",
         "control_cloud_scheduler",
@@ -117,7 +121,7 @@ def test_diag_package_purity():
 
 
 def test_no_scheduler_mode_strings_left():
-    """PD 分离判据字符串在包内清零(唯一形态 PD_mix)。"""
+    """PD-disaggregation discriminator strings are cleared from the package (PD_mix is the only form)."""
     for py in (VLLM_DIR / "v1" / "lwd_control").rglob("*.py"):
         text = py.read_text()
         assert "prefill_first" not in text, py
@@ -125,12 +129,14 @@ def test_no_scheduler_mode_strings_left():
 
 
 # ------------------------------------------------------------------ #
-# 评审闭环守卫(PR #3 review 轮落定的结构与接口约束)                  #
+# Review-loop guards (structural and interface constraints settled)  #
 # ------------------------------------------------------------------ #
 def test_lwd_control_uses_lwd_logger_only():
-    """日志接口唯一化:lwd_control 包内零 vllm.logger 直连,全部走
-    vllm.lwd_logger(消息自动带 [lwd] 前缀,VLLM_LWD_LOG_LEVEL 独立控级);
-    本 PR 在原生文件新加的两处日志(sched dbg / has_work)同口径。"""
+    """Unified logging interface: zero direct vllm.logger usage inside
+    the lwd_control package; everything goes through vllm.lwd_logger
+    (messages automatically carry the [lwd] prefix, VLLM_LWD_LOG_LEVEL
+    controls the level independently); the two log sites this PR adds
+    to native files (sched dbg / has_work) follow the same policy."""
     for py in (VLLM_DIR / "v1" / "lwd_control").rglob("*.py"):
         text = py.read_text()
         assert "from vllm.logger import" not in text, py
@@ -144,8 +150,9 @@ def test_lwd_control_uses_lwd_logger_only():
 
 
 def test_has_work_override_lives_in_base_engine():
-    """has_work 状态转换日志收编基类:core.py 原生判定不动,覆写在
-    LwdBaseEngineCore(评审:通用逻辑放 lwd_base_engine)。"""
+    """has_work state-transition logging folded into the base class:
+    the native core.py check stays untouched, the override lives in
+    LwdBaseEngineCore (review: common logic goes in lwd_base_engine)."""
     core = (VLLM_DIR / "v1" / "engine" / "core.py").read_text()
     assert "_last_has_work_state" not in core
     base_engine = (
@@ -155,9 +162,11 @@ def test_has_work_override_lives_in_base_engine():
 
 
 def test_message_dispatch_skeleton_in_base_engine():
-    """接收线程消息入口统一在基类:入口 _lwd_on_payload + 未知帧告警
-    丢弃住基类;两侧引擎只实现 _lwd_dispatch_message 钩子(评审:与
-    cloud 的分派一起提取到基类)。"""
+    """Receive-thread message entry unified in the base class: the
+    _lwd_on_payload entry + unknown-frame warn-and-drop live in the
+    base class; both engines only implement the _lwd_dispatch_message
+    hook (review: extracted into the base class together with cloud's
+    dispatch)."""
     base_engine = (
         VLLM_DIR / "v1" / "lwd_control" / "control_scheduler" / "lwd_base_engine.py"
     ).read_text()
@@ -173,12 +182,17 @@ def test_message_dispatch_skeleton_in_base_engine():
 
 
 def test_review_deleted_code_stays_deleted():
-    """评审裁剪的代码不再回流(后续功能落地时随功能整体回归):
-    - 零接受活行剔除(_filter_deliver_rows,4 卡问题修复,后续再带上);
-    - 边调度器请求入口编排 lwd_edge_add_request(收编进引擎 add_request);
-    - 云侧哈希链前缀缓存(_lwd_build_hashed_request / local_hasher /
-      request_block_hasher,前缀缓存功能另上);
-    - abort 通告接线(功能未上,wire 结构 LwdAbortNotify 保留)。"""
+    """Code trimmed during review must not flow back (it comes back as
+    a whole with the features when they land later):
+    - zero-accept live-row removal (_filter_deliver_rows, the 4-card
+      issue fix, to be brought back later);
+    - edge scheduler request-entry orchestration lwd_edge_add_request
+      (folded into the engine's add_request);
+    - cloud-side hash-chain prefix caching (_lwd_build_hashed_request /
+      local_hasher / request_block_hasher, the prefix caching feature
+      lands separately);
+    - abort notification wiring (feature not landed yet, the wire
+      struct LwdAbortNotify is kept)."""
     cloud_sched = (
         VLLM_DIR
         / "v1"
@@ -221,9 +235,11 @@ def test_review_deleted_code_stays_deleted():
 
 
 def test_edge_add_request_communication_in_engine():
-    """请求入口分工(评审:通信最好在 engine 里进行):引擎 add_request
-    编排 准入(lwd_admit_request)-> 云预告(_lwd_notify_request)->
-    原生 super().add_request(abort_immediately 走原生 abort_requests)。"""
+    """Request-entry division of labor (review: communication is best
+    done in the engine): the engine's add_request orchestrates
+    admission (lwd_admit_request) -> cloud notify (_lwd_notify_request)
+    -> native super().add_request (abort_immediately goes through
+    native abort_requests)."""
     edge_engine = (
         VLLM_DIR
         / "v1"
@@ -243,12 +259,13 @@ def test_edge_add_request_communication_in_engine():
         / "lwd_edge_scheduler.py"
     ).read_text()
     assert "def lwd_admit_request" in edge_sched
-    # 预告发布(通信)不再住调度器
+    # notify publishing (communication) no longer lives in the scheduler
     assert "def lwd_edge_notify_request" not in edge_sched
 
 
 def test_edge_batch_queue_depth_is_two():
-    """批队列深度 = 2(评审定值;性能验证在真机环境补)。"""
+    """Batch queue depth = 2 (settled in review; performance validation
+    to be done on a real machine environment)."""
     import regex as re
 
     edge_engine = (
