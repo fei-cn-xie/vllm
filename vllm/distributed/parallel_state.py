@@ -1792,18 +1792,11 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
-    if config is not None and config.lwd_config is not None:
-        # LWD: the incoming rank is the instance-local TP rank; join the one
-        # shared world the topology describes (global rank + wire store).
-        from vllm.distributed.lwd import get_lwd_distributed_args
-
-        world_size, rank, distributed_init_method = get_lwd_distributed_args(
-            config, rank
-        )
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
-    if (
+    if config is not None and config.lwd_config is not None:
+        world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
+    elif (
         config is not None
-        and config.lwd_config is None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
         and (
             config.parallel_config.nnodes > 1
@@ -2290,6 +2283,28 @@ def initialize_model_parallel(
         _ETP.rank_in_group,
         _EP.rank_in_group if _EP is not None else "N/A",
         _EPLB.rank_in_group if _EPLB is not None else "N/A",
+    )
+
+
+def _lwd_world_args(vllm_config: "VllmConfig", rank: int) -> tuple[int, int, str]:
+    """World size, global rank and init method of the shared LWD HCCL world.
+
+    Executors and workers number their ranks within the local instance DP,
+    as in a centralized deployment; only the torch world uses the global
+    ranks of the topology, the way native data parallelism offsets the rank
+    above. Global rank 0 hosts the store, so `master_addr` must be its host.
+    """
+    lwd_config = vllm_config.lwd_config
+    assert lwd_config is not None
+    parallel_config = vllm_config.parallel_config
+    dp_ranks = lwd_config.instance.dp[parallel_config.data_parallel_index].ranks
+    distributed_init_method = get_distributed_init_method(
+        parallel_config.master_addr, parallel_config.master_port
+    )
+    return (
+        lwd_config.topology.deployment.hccl_world_size,
+        dp_ranks[rank],
+        distributed_init_method,
     )
 
 

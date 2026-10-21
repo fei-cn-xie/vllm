@@ -17,6 +17,7 @@ the engine's native batch-queue path. See lwd_chunked_prefill_design.md
 
 from __future__ import annotations
 
+import copy
 import time
 from collections import deque
 from collections.abc import Callable
@@ -57,6 +58,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.request import Request
 
 LwdSendToCloud = Callable[[LwdEdgeToCloudMessage], None]
@@ -81,20 +83,32 @@ _LWD_FINISH_STATUS = {
 _LWD_MAX_PENDING_CHUNKS = 3
 
 
+def _lwd_without_prefix_caching(vllm_config: VllmConfig) -> VllmConfig:
+    """The scheduler's view of the config, with prefix caching off.
+
+    The edge holds no KV cache (no KV cache groups), so the KV cache manager
+    must not look up prefix hits: a hit would skip embedding blocks the edge
+    never computed. The engine keeps prefix caching on in its own config, so
+    it still builds the request block hasher whose hash chain the edge sends
+    to the cloud for cloud-side prefix hits.
+    """
+    scheduler_vllm_config = copy.copy(vllm_config)
+    scheduler_vllm_config.cache_config = copy.copy(vllm_config.cache_config)
+    scheduler_vllm_config.cache_config.enable_prefix_caching = False
+    return scheduler_vllm_config
+
+
 class LwdEdgeScheduler(LwdBaseScheduler):
     """Pure prefill scheduling semantics + control-plane egress
     (RangeNotify/seqno)."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, vllm_config: VllmConfig, **kwargs) -> None:
+        super().__init__(
+            *args, vllm_config=_lwd_without_prefix_caching(vllm_config), **kwargs
+        )
         # Injected by the engine once the cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self._lwd_seqno = 0
-        # Prefix caching: manager-level hit lookup must stay disabled (a hit
-        # makes the first item's offset != 0, and hit blocks that were never
-        # written to KV still occupy the block pool); config-level enablement
-        # is kept so the hash chain is still produced for cloud-side hits
-        self.kv_cache_manager.enable_caching = False
         # Pending ledger (single account): seqno -> set of in-batch requests
         # whose result has not yet arrived. One seqno = one cloud-step
         # consumption unit; a request is removed from its batch once its
@@ -275,9 +289,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         }
 
     @staticmethod
-    def _lwd_row_disposition(
-        accepted: int, has_tokens: bool, finished: bool
-    ) -> str:
+    def _lwd_row_disposition(accepted: int, has_tokens: bool, finished: bool) -> str:
         """Per-row delivery disposition (pad-and-skip, ported from the mm
         branch 7ff2ddc3e):
 
@@ -318,10 +330,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             finish_reason = self._lwd_finish_code(notify, index)
             finished_now = finish_reason is not None
             sampled_token_ids = list(sampled_token_map.get(request_id, []))
-            accepted = (
-                accepts[index] if accepts
-                else (1 if sampled_token_ids else 0)
-            )
+            accepted = accepts[index] if accepts else (1 if sampled_token_ids else 0)
             disposition = self._lwd_row_disposition(
                 accepted, bool(sampled_token_ids), finished_now
             )
@@ -532,7 +541,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
         lwd_logger.info(
             "[edge] range announced seqno=%d reqs=%d tokens=%d",
-            seqno, len(items), sum(i.num_tokens for i in items),
+            seqno,
+            len(items),
+            sum(i.num_tokens for i in items),
         )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1

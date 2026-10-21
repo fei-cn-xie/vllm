@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from typing import Any
 
 import torch
 
@@ -21,15 +22,11 @@ from vllm.v1.engine.core import EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
-from vllm.v1.lwd_control.lwd_hash_chain import lwd_cloud_block_hasher
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
-)
-from vllm.v1.lwd_control.control_scheduler.lwd_chunk_align import (
-    lwd_build_chunk_align_profile,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -73,16 +70,19 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_hint_mq = create_hint_mq()
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
         # The cloud endpoint worker published its done-report MQ handle to
-        # the wire TCP store during init_device (same rendezvous the
-        # deployment already depends on); acquire the reader here - the
-        # workers are ready, so the key is set. This keeps the vllm
-        # executor entirely free of LWD plumbing.
-        from vllm.distributed.lwd import get_lwd_init_method
+        # the shared world's TCP store during init_device (the same
+        # rendezvous at master_addr:master_port the HCCL world joins);
+        # acquire the reader here - the workers are ready, so the key is
+        # set. This keeps the vllm executor entirely free of LWD plumbing.
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import acquire_done_mq
 
-        assert self.vllm_config.lwd_config is not None
+        from vllm.utils.network_utils import get_distributed_init_method
+
+        parallel_config = self.vllm_config.parallel_config
         self._lwd_done_mq = acquire_done_mq(
-            get_lwd_init_method(self.vllm_config.lwd_config)
+            get_distributed_init_method(
+                parallel_config.master_addr, parallel_config.master_port
+            )
         )
         lwd_logger.info(
             "[pre-recv] hint MQ created by engine, done MQ attached: %s",
@@ -94,17 +94,11 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_edge: LwdPeer | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits the edge checks (same inputs of the cap/preflight
-        # formulas on both sides); the chunk align profile carries the
-        # cloud-only chunk-cutting branches (mamba block alignment, MTP
-        # prefill lookahead) the edge adopts so its native schedule() cuts
-        # chunks exactly like this side will.
+        # formulas on both sides).
         self._lwd_cloud_params = LwdCloudParamsNotify(
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
             num_speculative_tokens=lwd_spec_factor(self.vllm_config) - 1,
-            chunk_align=lwd_build_chunk_align_profile(
-                self.scheduler, self.vllm_config.cache_config
-            ),
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -204,7 +198,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         request notify -> native ADD."""
         lwd_logger.info(
             "[cloud] ingest msg=%s seqno=%s",
-            type(msg).__name__, getattr(msg, "seqno", "-"),
+            type(msg).__name__,
+            getattr(msg, "seqno", "-"),
         )
         # TODO(lwd): several edges per cloud DP rank need requests tracked by
         # the peer that owns them, issue #8.
@@ -242,7 +237,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             # hint2sub go negative, which looks like a timing anomaly.
             lwd_logger.info(
                 "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
-                msg.seqno, num_tokens, time.monotonic(),
+                msg.seqno,
+                num_tokens,
+                time.monotonic(),
             )
             post_irecv_hint(make_recv_hint(msg.seqno, num_tokens, aux_rows))
         elif isinstance(msg, LwdRequestNotify):
@@ -250,7 +247,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             lwd_logger.info(
                 "[cloud] request added req=%s tokens=%d",
-                msg.request_id, msg.num_prompt_tokens,
+                msg.request_id,
+                msg.num_prompt_tokens,
             )
 
     def shutdown(self) -> None:
@@ -289,11 +287,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             prompt_embeds=prompt_embeds,
             sampling_params=sampling_params,
             pooling_params=None,
-            block_hasher=lwd_cloud_block_hasher(
-                self.vllm_config,
-                self.scheduler.kv_cache_config,
-                req_notify.block_hashes,
-            ),
         )
         return request
 

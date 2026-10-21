@@ -44,7 +44,8 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
 
 class LwdCloudScheduler(LwdBaseScheduler):
-    """Notify-gated prefill/decode mixed scheduler (PD_mix, the sole cloud-side form)."""
+    """Notify-gated prefill/decode mixed scheduler (PD_mix, the sole
+    cloud-side form)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -103,9 +104,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 for outputs in engine_core_outputs.values()
                 for out in outputs.outputs
             }
-            meta.num_accepted_tokens = [
-                committed.get(rid, 0) for rid in meta.req_ids
-            ]
+            meta.num_accepted_tokens = [committed.get(rid, 0) for rid in meta.req_ids]
             LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
@@ -293,11 +292,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """Early-receive gate: release only after the UP data of this seqno
         is fully received; criterion = channel watermark (FIFO completion
         order)."""
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             is_irecv_complete,
             watermark,
         )
-        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
         ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
         # [Lwd][pre-recv] Gate readings: use the same monotonic clock as
@@ -312,14 +311,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
             seen.discard(notify.seqno)
             lwd_logger.info(
                 "[cloud-sched] notify seqno=%d gate OPEN watermark=%d",
-                notify.seqno, watermark(LwdChannelType.UP),
+                notify.seqno,
+                watermark(LwdChannelType.UP),
             )
         elif notify.seqno not in seen:
             seen.add(notify.seqno)
             lwd_logger.info(
                 "[cloud-sched] notify seqno=%d gate HOLD watermark=%d "
                 "(UP not fully received; silent retry afterwards)",
-                notify.seqno, watermark(LwdChannelType.UP),
+                notify.seqno,
+                watermark(LwdChannelType.UP),
             )
         return ready
 
