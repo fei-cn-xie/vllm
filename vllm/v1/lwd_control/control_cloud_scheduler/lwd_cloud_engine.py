@@ -282,11 +282,6 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         判定;云侧无客户端 generation_config,传空)。"""
         values = {f: getattr(req_notify, f) for f in LWD_SAMPLING_DEFAULTS}
         values["stop_token_ids"] = list(values["stop_token_ids"])
-        lwd_logger.info(
-            "[LWD][sampler-probe] wire penalties req=%s rep=%s pres=%s freq=%s",
-            req_notify.request_id, req_notify.repetition_penalty,
-            req_notify.presence_penalty, req_notify.frequency_penalty,
-        )
         sampling_params = SamplingParams(**values)
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
