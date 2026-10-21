@@ -16,7 +16,8 @@ from typing import NamedTuple
 
 
 class LwdPrefillCandidate(NamedTuple):
-    """Batch assembly candidate: the scheduler distills a Request into these three fields at the call site."""
+    """Batch assembly candidate: the scheduler distills a Request into
+    these three fields at the call site."""
 
     request_id: str
     num_prompt_tokens: int
@@ -57,19 +58,24 @@ def lwd_pick_prefill_batch(
         running, picked, expected, cap, chunk_unit, single_prefill_min_tokens
     )
     _pick_new_requests(
-        waiting, picked, expected, used, cap, free_seq,
-        chunk_unit, single_prefill_min_tokens, single_prefill,
+        waiting,
+        picked,
+        expected,
+        used,
+        cap,
+        free_seq,
+        chunk_unit,
+        single_prefill_min_tokens,
+        single_prefill,
     )
     return picked, expected
 
 
-def _is_single_prefill(
-    single_prefill_min_tokens: int, num_prompt_tokens: int
-) -> bool:
-    """Whether this request triggers the exclusive rule (total prompt length reaches the threshold)."""
+def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -> bool:
+    """Whether this request triggers the exclusive rule (total prompt
+    length reaches the threshold)."""
     return (
-        single_prefill_min_tokens > 0
-        and num_prompt_tokens >= single_prefill_min_tokens
+        single_prefill_min_tokens > 0 and num_prompt_tokens >= single_prefill_min_tokens
     )
 
 
@@ -132,8 +138,12 @@ def _pick_resumes(
         if single_prefill and picked:
             break
         used, batch_closed = _append_chunk(
-            picked, expected, used, cap,
-            cand.request_id, min(remaining, chunk_unit),
+            picked,
+            expected,
+            used,
+            cap,
+            cand.request_id,
+            min(remaining, chunk_unit),
         )
         if batch_closed:
             break
@@ -156,8 +166,7 @@ def _pick_new_requests(
     head (preserves FCFS and seqno chain order). single_prefill is passed
     in from the resume loop (True means this batch is already closed).
     Returns used."""
-    new_count = 0
-    for cand in waiting:
+    for new_count, cand in enumerate(waiting):
         if single_prefill and picked:
             break
         single_prefill = _is_single_prefill(
@@ -173,5 +182,4 @@ def _pick_new_requests(
         )
         if batch_closed:
             break
-        new_count += 1
     return used

@@ -18,6 +18,10 @@ errors.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import torch
+
 from vllm.lwd_logger import lwd_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
@@ -42,9 +46,34 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 
+LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
+"""``ModelRunnerOutput.lwd_down_carrier`` attached by the cloud worker:
+(pinned packed meta, req_ids, hidden numel, DOWN seqno)."""
+
+
+@dataclass
+class LwdC2eMeta:
+    """Step metadata unpacked from the cloud worker's DOWN carrier; the
+    scheduler forwards it to the edge ahead of the DOWN hidden tensor
+    (the data plane carries only the tensor itself)."""
+
+    # Total element count of the DOWN hidden tensor for this step.
+    hidden_num_elements: int
+    # Per-request sampled-token rank within the step's logits ("top-id-th"),
+    # one row per request in hidden row order.
+    top_id_ths: list[list[int]]
+    # Per-request draft accept counts (0 for non-spec steps).
+    num_accepted_tokens: list[int]
+    # Request ids in hidden row order.
+    req_ids: list[str]
+    # DOWN channel seqno of this step's packet; the edge posts its matching
+    # irecv with this exact value for pairing on the tag-less HCCL wire.
+    down_seqno: int
+
 
 class LwdCloudScheduler(LwdBaseScheduler):
-    """Notify-gated prefill/decode mixed scheduler (PD_mix, the sole cloud-side form)."""
+    """Notify-gated prefill/decode mixed scheduler (PD_mix, the sole
+    cloud-side form)."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -103,9 +132,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 for outputs in engine_core_outputs.values()
                 for out in outputs.outputs
             }
-            meta.num_accepted_tokens = [
-                committed.get(rid, 0) for rid in meta.req_ids
-            ]
+            meta.num_accepted_tokens = [committed.get(rid, 0) for rid in meta.req_ids]
             LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
             finish_reasons = self._lwd_c2e_finish_reasons(
                 meta.req_ids, engine_core_outputs
@@ -167,7 +194,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
 
     @staticmethod
-    def _lwd_carrier_to_meta(carrier):
+    def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:
         """Unpack the harvested payload into step metadata.
 
         Payload = a flat int tensor (CPU, harvested by the worker's
@@ -191,8 +218,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         (here [[r0,r1,r2],[r0]]). The two magic numbers -2*n_req/-n_req are
         the widths of the two fixed-length tails, the "counts segment +
         seg_lens segment"."""
-        from vllm.v1.outputs import LwdC2eMeta
-
         packed, req_ids, hidden_numel, seqno = carrier
         n_req = len(req_ids)
         vals = packed.tolist()
@@ -293,11 +318,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """Early-receive gate: release only after the UP data of this seqno
         is fully received; criterion = channel watermark (FIFO completion
         order)."""
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             is_irecv_complete,
             watermark,
         )
-        from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
         ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
         # [Lwd][pre-recv] Gate readings: use the same monotonic clock as
@@ -312,14 +337,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
             seen.discard(notify.seqno)
             lwd_logger.info(
                 "[cloud-sched] notify seqno=%d gate OPEN watermark=%d",
-                notify.seqno, watermark(LwdChannelType.UP),
+                notify.seqno,
+                watermark(LwdChannelType.UP),
             )
         elif notify.seqno not in seen:
             seen.add(notify.seqno)
             lwd_logger.info(
                 "[cloud-sched] notify seqno=%d gate HOLD watermark=%d "
                 "(UP not fully received; silent retry afterwards)",
-                notify.seqno, watermark(LwdChannelType.UP),
+                notify.seqno,
+                watermark(LwdChannelType.UP),
             )
         return ready
 

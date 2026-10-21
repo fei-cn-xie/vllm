@@ -181,9 +181,10 @@ class LwdControlDiag:
 
         rate = self._spec_accepted / self._spec_draft_tokens * 100
         lwd_logger.info(
-            "[spec] cumulative: rate=%.1f%% accepted=%d "
-            "draft_tokens=%d",
-            rate, self._spec_accepted, self._spec_draft_tokens,
+            "[spec] cumulative: rate=%.1f%% accepted=%d draft_tokens=%d",
+            rate,
+            self._spec_accepted,
+            self._spec_draft_tokens,
         )
 
     # ------------------------------------------------------------------ #
@@ -223,7 +224,7 @@ class LwdControlDiag:
         return ids_by_req
 
     @staticmethod
-    def bypass_unembed_rows(batch) -> "tuple[list[str], list[list[int]]] | None":
+    def bypass_unembed_rows(batch) -> tuple[list[str], list[list[int]]] | None:
         """DISABLE_DOWN passthrough predicate and row set: returns
         (req_ids, bypass token rows) when the batch is UNEMBED and the
         notify carries bypass tokens (hidden=0), else None. Produces
@@ -275,16 +276,14 @@ class LwdControlDiag:
         only when zero-accept rows exist (a normal MTP step accepts at
         least the root token per row, so zero-accept ~= 0 and the log
         volume stays bounded)."""
-        rows = LwdControlDiag.zero_accept_rows(
-            req_ids, accepted, finish_reasons
-        )
+        rows = LwdControlDiag.zero_accept_rows(req_ids, accepted, finish_reasons)
         if rows:
             from vllm.lwd_logger import lwd_logger
 
             lwd_logger.info(
-                "[eos-trace] cloud seqno=%s zero-accept rows "
-                "(rid,acc,fin)=%s",
-                seqno, rows,
+                "[eos-trace] cloud seqno=%s zero-accept rows (rid,acc,fin)=%s",
+                seqno,
+                rows,
             )
 
     @staticmethod
@@ -307,7 +306,12 @@ class LwdControlDiag:
         lwd_logger.info(
             "[eos-trace] edge kill seqno=%s rid=%s accepted=%d "
             "finish=%d batch_rows=%d sampled_rows=%d",
-            seqno, rid, accepted, finish_code, batch_rows, sampled_rows,
+            seqno,
+            rid,
+            accepted,
+            finish_code,
+            batch_rows,
+            sampled_rows,
         )
 
     @staticmethod
@@ -322,14 +326,9 @@ class LwdControlDiag:
         backfill row set, or an empty token list) — Point C data. Rows
         with accepted=0 are legitimately not produced by the worker
         and do not count as missing."""
-        filled = {
-            rid: toks
-            for rid, toks in zip(result_req_ids, sampled_token_ids)
-        }
+        filled = {rid: toks for rid, toks in zip(result_req_ids, sampled_token_ids)}
         return [
-            rid
-            for rid, acc in zip(req_ids, accepts)
-            if acc > 0 and not filled.get(rid)
+            rid for rid, acc in zip(req_ids, accepts) if acc > 0 and not filled.get(rid)
         ]
 
     @staticmethod
@@ -351,6 +350,6 @@ class LwdControlDiag:
 
             lwd_logger.info(
                 "[eos-trace] worker seqno=%s missing rows=%s",
-                seqno, missing,
+                seqno,
+                missing,
             )
-
